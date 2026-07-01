@@ -27,14 +27,23 @@
 from ._pygit2 import GitError
 from .ffi import C, ffi
 
-__all__ = ['GitError']
+__all__ = ['GitError', 'check_error']
 
 value_errors = set([C.GIT_EEXISTS, C.GIT_EINVALIDSPEC, C.GIT_EAMBIGUOUS])
 
 
-def check_error(err: int, io: bool = False) -> None:
+def check_error(
+    err: int,
+    io: bool = False,
+    user_exception: BaseException | None = None,
+) -> None:
     if err >= 0:
         return
+
+    if err == C.GIT_EUSER and user_exception:
+        raise user_exception
+        # may need this? depends on whether this raise "adds to" or "replaces" the traceback:
+        #   raise user_exception.with_traceback(user_exception.__traceback__)
 
     # These are special error codes, they should never reach here
     test = err != C.GIT_EUSER and err != C.GIT_PASSTHROUGH

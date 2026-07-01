@@ -22,10 +22,15 @@
 # along with this program; see the file COPYING.  If not, write to
 # the Free Software Foundation, 51 Franklin Street, Fifth Floor,
 # Boston, MA 02110-1301, USA.
+from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+import contextlib
+import re
+import threading
+from collections.abc import Callable, Generator, Iterator
 from os import PathLike
-from typing import TYPE_CHECKING, Optional
+from types import TracebackType
+from typing import TYPE_CHECKING, Literal, Self, cast, overload, override
 
 try:
     from functools import cached_property
@@ -33,12 +38,26 @@ except ImportError:
     from cached_property import cached_property  # type: ignore
 
 # Import from pygit2
+from .enums import ConfigLevel
 from .errors import check_error
 from .ffi import C, ffi
 from .utils import to_bytes
 
 if TYPE_CHECKING:
-    from ._libgit2.ffi import GitConfigC, GitConfigEntryC
+    from ._libgit2.ffi import (
+        GitConfigBackendC,
+        GitConfigBackendEntryC,
+        GitConfigC,
+        GitConfigEntryC,
+        GitConfigIteratorC,
+        GitRepositoryC,
+        PyGitConfigBackendEntryC,
+        PyGitConfigBackendWrapperC,
+        PyGitConfigIteratorEntryC,
+        PyGitConfigIteratorWrapperC,
+        _Pointer,
+        char_pointer,
+    )
     from .repository import BaseRepository
 
 
@@ -64,9 +83,10 @@ class ConfigIterator:
         return self._next_entry()
 
     def _next_entry(self) -> 'ConfigEntry':
+        self._config._stored_exception = None
         centry = ffi.new('git_config_entry **')
         err = C.git_config_next(centry, self._iter)
-        check_error(err)
+        check_error(err, user_exception=self._config._stored_exception)
 
         return ConfigEntry._from_c(centry[0], self)
 
@@ -98,38 +118,72 @@ class Config:
     might change mid-iteration if you don't use a snapshot.
 
     This class can technically be used to manually read and write a repository's
-    configuration file by pointing the constructor to the repository's
+    local configuration by pointing the constructor to the repository's
     ``.git/config`` file, but this is not recommended. The resulting ``Config``
     object represents only the configuration directly within ``.git/config``.
     It does not represent the total effective configuration for that repository
-    that includes the combined system, global (user), and global (user) XDG.
-    Instead, use :meth:`BaseRepository.config` for loading a repository's
-    configuration.
+    that includes the combined program, system, XDG, global (user), and local
+    configurations. Instead, use :meth:`BaseRepository.config` or
+    :meth:`BaseRepository.config_snapshot` for loading a local configuration
+    and see :class:`RepositoryConfig` for special behaviors supported by the
+    local configuration.
     """
 
-    _repo: Optional['BaseRepository']
     _config: 'GitConfigC'
 
-    def __init__(self, path: PathLike | str | None = None) -> None:
-        cconfig = ffi.new('git_config **')
+    @overload
+    def __init__(self, /):
+        """Constructs a new, empty ``Config`` object pointing to no file.
 
-        if not path:
-            err = C.git_config_new(cconfig)
+        To persist changes made to this ``Config`` object, you must use
+        :meth:`Config.add_file`.
+        """
+        ...
+
+    @overload
+    def __init__(self, path: PathLike | str, /) -> None:
+        """Constructs a ``Config`` object backed by the specified file.
+
+        The configuration from the specified file is loaded, and subsequent writes
+        will persist to that file. Additional files can be added to the config,
+        with different levels, using :meth:`Config.add_file`.
+        """
+        ...
+
+    @overload
+    def __init__(self, *, c_config: 'GitConfigC', is_snapshot: bool) -> None:
+        """For internal use only.
+
+        Constructs a ``Config`` object from a config object pointer.
+        """
+        ...
+
+    def __init__(
+        self,
+        path: PathLike | str | None = None,
+        *,
+        c_config: 'GitConfigC | None' = None,
+        is_snapshot: bool = False,
+    ) -> None:
+        if path is not None and c_config is not None:
+            raise ValueError('Cannot initialize Config from both path and c_config')
+
+        self._is_snapshot = is_snapshot
+        self._stored_exception: BaseException | None = None
+
+        if c_config is not None:
+            self._config = c_config
         else:
-            path_bytes = to_bytes(path)
-            err = C.git_config_open_ondisk(cconfig, path_bytes)
+            cconfig = ffi.new('git_config **')
 
-        check_error(err, io=True)
-        self._repo = None
-        self._config = cconfig[0]
+            if not path:
+                err = C.git_config_new(cconfig)
+            else:
+                path_bytes = to_bytes(path)
+                err = C.git_config_open_ondisk(cconfig, path_bytes)
 
-    @classmethod
-    def from_c(cls, repo: Optional['BaseRepository'], ptr: 'GitConfigC') -> 'Config':
-        config = cls.__new__(cls)
-        config._repo = repo
-        config._config = ptr
-
-        return config
+            check_error(err, io=True)
+            self._config = cconfig[0]
 
     def __del__(self) -> None:
         try:
@@ -137,30 +191,42 @@ class Config:
         except AttributeError:
             pass
 
-    def _get(self, key: str | bytes) -> tuple[int, 'ConfigEntry']:
+    def _check_error(self, err: int, io: bool = False):
+        try:
+            check_error(err, io=io, user_exception=self._stored_exception)
+        finally:
+            self._stored_exception = None
+
+    def _get(self, key: str | bytes) -> tuple[int, 'ConfigEntry | None']:
         key = str_to_bytes(key, 'key')
 
         entry = ffi.new('git_config_entry **')
         err = C.git_config_get_entry(entry, self._config, key)
 
-        return err, ConfigEntry._from_c(entry[0])
+        if err >= 0:
+            return err, ConfigEntry._from_c(entry[0])
+
+        return err, None
 
     def _get_entry(self, key: str | bytes) -> 'ConfigEntry':
+        self._stored_exception = None
         err, entry = self._get(key)
 
         if err == C.GIT_ENOTFOUND:
             raise KeyError(key)
 
-        check_error(err)
+        self._check_error(err)
+        assert entry is not None
         return entry
 
     def __contains__(self, key: str | bytes) -> bool:
-        err, cstr = self._get(key)
+        self._stored_exception = None
+        err, _ = self._get(key)
 
         if err == C.GIT_ENOTFOUND:
             return False
 
-        check_error(err)
+        self._check_error(err)
 
         return True
 
@@ -175,9 +241,10 @@ class Config:
         return entry.value
 
     def __setitem__(self, key: str | bytes, value: bool | int | str | bytes) -> None:
+        self._stored_exception = None
         key = str_to_bytes(key, 'key')
 
-        err = 0
+        err: int
         if isinstance(value, bool):
             err = C.git_config_set_bool(self._config, key, value)
         elif isinstance(value, int):
@@ -185,13 +252,14 @@ class Config:
         else:
             err = C.git_config_set_string(self._config, key, to_bytes(value))
 
-        check_error(err)
+        self._check_error(err)
 
     def __delitem__(self, key: str | bytes) -> None:
+        self._stored_exception = None
         key = str_to_bytes(key, 'key')
 
         err = C.git_config_delete_entry(self._config, key)
-        check_error(err)
+        self._check_error(err)
 
     def __iter__(self) -> Iterator['ConfigEntry']:
         """
@@ -200,9 +268,10 @@ class Config:
         variable. Be aware that this may return multiple versions of each entry
         if they are set multiple times in the configuration files.
         """
+        self._stored_exception = None
         citer = ffi.new('git_config_iterator **')
         err = C.git_config_iterator_new(citer, self._config)
-        check_error(err)
+        self._check_error(err)
 
         return ConfigIterator(self, citer[0])
 
@@ -214,12 +283,13 @@ class Config:
         The optional ''regex'' parameter is expected to be a regular expression
         to filter the variables we're interested in.
         """
+        self._stored_exception = None
         name = str_to_bytes(name, 'name')
         regex_bytes = to_bytes(regex or None)
 
         citer = ffi.new('git_config_iterator **')
         err = C.git_config_multivar_iterator_new(citer, self._config, name, regex_bytes)
-        check_error(err)
+        self._check_error(err)
 
         return ConfigMultivarIterator(self, citer[0])
 
@@ -230,23 +300,25 @@ class Config:
         expression to indicate which values to replace. Changes are persisted
         to the configuration file(s) backing this ``Config``.
         """
+        self._stored_exception = None
         name = str_to_bytes(name, 'name')
         regex = str_to_bytes(regex, 'regex')
         value = str_to_bytes(value, 'value')
 
         err = C.git_config_set_multivar(self._config, name, regex, value)
-        check_error(err)
+        self._check_error(err)
 
     def delete_multivar(self, name: str | bytes, regex: str | bytes) -> None:
         """Delete a multivar ''name''. ''regexp'' is a regular expression to
         indicate which values to delete. Changes are persisted to the
         configuration file(s) backing this ``Config``.
         """
+        self._stored_exception = None
         name = str_to_bytes(name, 'name')
         regex = str_to_bytes(regex, 'regex')
 
         err = C.git_config_delete_multivar(self._config, name, regex)
-        check_error(err)
+        self._check_error(err)
 
     def get_bool(self, key: str | bytes) -> bool:
         """Look up *key* and parse its value as a boolean as per the git-config
@@ -255,11 +327,11 @@ class Config:
         Truthy values are: 'true', 1, 'on' or 'yes'. Falsy values are: 'false',
         0, 'off' and 'no'
         """
-
+        self._stored_exception = None
         entry = self._get_entry(key)
         res = ffi.new('int *')
         err = C.git_config_parse_bool(res, entry.c_value)
-        check_error(err)
+        self._check_error(err)
 
         return res[0] != 0
 
@@ -270,33 +342,53 @@ class Config:
         A value can have a suffix 'k', 'm' or 'g' which stand for 'kilo',
         'mega' and 'giga' respectively.
         """
-
+        self._stored_exception = None
         entry = self._get_entry(key)
         res = ffi.new('int64_t *')
         err = C.git_config_parse_int64(res, entry.c_value)
-        check_error(err)
+        self._check_error(err)
 
         return res[0]
 
-    def add_file(self, path: str | PathLike, level: int = 0, force: int = 0) -> None:
+    def add_file(
+        self,
+        path: str | PathLike,
+        level: ConfigLevel | int | None = None,
+        force: int = 0,
+    ) -> None:
         """Add a config file instance to an existing config."""
+        self._stored_exception = None
+        if level is None:
+            level = 0
+        elif isinstance(level, ConfigLevel):
+            level = level.value
 
         err = C.git_config_add_file_ondisk(
             self._config, to_bytes(path), level, ffi.NULL, force
         )
-        check_error(err)
+        self._check_error(err)
 
-    def snapshot(self) -> 'Config':
-        """Create a snapshot from this ``Config`` object.
+    @property
+    def is_snapshot(self) -> bool:
+        """Indicates whether this Config object is a read-only snapshot
+        of the underlying configuration.
+        """
+        return self._is_snapshot
+
+    def snapshot(self) -> Config:
+        """Create a read-only snapshot of this ``Config`` object.
 
         This means that looking up multiple values will use the same version
         of the configuration files.
         """
-        ccfg = ffi.new('git_config **')
-        err = C.git_config_snapshot(ccfg, self._config)
-        check_error(err)
+        return Config(c_config=self._c_snapshot(), is_snapshot=True)
 
-        return Config.from_c(self._repo, ccfg[0])
+    def _c_snapshot(self) -> 'GitConfigC':
+        self._stored_exception = None
+        c_config = ffi.new('git_config **')
+        err = C.git_config_snapshot(c_config, self._config)
+        self._check_error(err)
+        return c_config[0]
 
     #
     # Methods to parse a string according to the git-config rules
@@ -338,6 +430,8 @@ class Config:
 
         The system configuration file is the one found at ``/etc/gitconfig`` or
         ``%PROGRAMFILES%\\Git\\etc\\gitconfig``, depending on the operating system.
+
+        Raises ``IOError`` if the configuration file is not found.
         """
         return Config._from_found_config(C.git_config_find_system)
 
@@ -349,6 +443,8 @@ class Config:
         location for Git, which is ``$HOME/.gitconfig``. This will not find the file
         at the XDG-compatible user config file location (for that, see
         :meth:`Config.get_xdg_config`).
+
+        Raises ``IOError`` if the configuration file is not found.
         """
         return Config._from_found_config(C.git_config_find_global)
 
@@ -359,8 +455,1014 @@ class Config:
         The XDG-compatible user config file follows the XDG Base Directory Specification.
         This file is located at ``$HOME/.config/git/config``. This will not find the file
         at the standard user config location (for that, see :meth:`Config.get_global_config`).
+
+        Raises ``IOError`` if the configuration file is not found.
         """
         return Config._from_found_config(C.git_config_find_xdg)
+
+
+class DefaultConfig(Config):
+    """A special-case :class:`Config` extension representing the total default configuration.
+
+    This extension to the base ``Config`` class represents the total default configuration
+    outside the context of a repository (for that, see :class:`RepositoryConfig`). It also
+    serves as a semantic indicator of the scope of the configuration.
+
+    The ``DefaultConfig`` includes the program, system, XDG, and global (user) configurations.
+    This is, in essence, the "effective" configuration that Git uses when performing
+    operations that are not against a repository. When a read operations occurs, the
+    configurations are searched in the following order: global (user), XDG, system,
+    and then program data.
+    """
+
+    @overload
+    def __init__(self, /) -> None:
+        """Load the total default configuration and construct a ``DefaultConfig`` from it."""
+        ...
+
+    @overload
+    def __init__(self, *, c_snapshot: 'GitConfigC') -> None:
+        """For internal use only.
+
+        Constructs a ``DefaultConfig`` from a given snapshot config object pointer.
+        The resulting configuration will be read-only.
+        """
+        ...
+
+    def __init__(self, *, c_snapshot: 'GitConfigC | None' = None):
+        if c_snapshot is not None:
+            super().__init__(c_config=c_snapshot, is_snapshot=True)
+        else:
+            c_config = ffi.new('git_config **')
+            err = C.git_config_open_default(c_config)
+            check_error(err)
+            super().__init__(c_config=c_config[0], is_snapshot=False)
+
+    @override
+    def snapshot(self) -> DefaultConfig:
+        """Create a read-only snapshot of this ``DefaultConfig`` object.
+
+        This means that looking up multiple values will use the same version
+        of the configuration files.
+
+        Raises ``TypeError`` if this is already a snapshot.
+        """
+        if self._is_snapshot:
+            raise TypeError('This default config is already a snapshot.')
+        return DefaultConfig(c_snapshot=self._c_snapshot())
+
+
+class RepositoryConfig(Config):
+    """A special-case :class:`Config` extension that handles local (repository) configuration.
+
+    This extension to the base ``Config`` class handles some of the special behaviors
+    associated with repository configs, as well as serving as a semantic indicator for
+    the scope of the configuration. You should not construct it directly, but instead
+    use one of :meth:`BaseRepository.config` or :meth:`BaseRepository.config_snapshot`
+    to obtain the local configuration.
+
+    The ``RepositoryConfig`` represents not just the configuration present in
+    ``.git/config``, but the sum total of that plus the program, system, XDG, and global
+    (user) configurations. This is, in essence, the "effective" configuration that Git uses
+    when performing operations against this repository. When a read operation occurs,
+    the local configuration is searched first, then the global (user), XDG, system, and
+    finally program data configurations, in that order. When a write operation occurs,
+    only the local configuration is changed.
+
+    The ``RepositoryConfig`` can also be used as a context manager to effect a temporary
+    in-memory override of the local configuration. When the context manager is entered,
+    an empty in-memory configuration backend is assigned to the configuration and given
+    the highest read priority. During this context, write operations change the in-memory
+    backend and do not affect the local configuration file. Read operations consult the
+    in-memory backend first before then consulting the usual order. When the context
+    manager exits, the in-memory backend is erased, undoing any changes made to it and
+    allowing write operations to resume affecting the local configuration.
+
+    Only writeable ``RepositoryConfig`` objects can be used as a context manager.
+    Read-only snapshot ``RepositoryConfig`` objects cannot.
+    """
+
+    @overload
+    def __init__(
+        self,
+        repo: 'BaseRepository',
+        c_repo: 'GitRepositoryC',
+        *,
+        do_snapshot: bool = False,
+    ) -> None:
+        """For internal use only.
+
+        See :meth:`BaseRepository.config` for obtaining a repository configuration
+        or :meth:`BaseRepository.config_snapshot` for obtaining a snapshot.
+
+        Constructs a new ``RepositoryConfig`` from the given repository.
+
+        If ``do_snapshot`` is ``True`` (defaults to ``False``), a read-only snapshot
+        configuration will be created from the repository. Otherwise, a writeable
+        configuration will be created.
+        """
+        ...
+
+    @overload
+    def __init__(
+        self,
+        repo: 'BaseRepository',
+        c_repo: 'GitRepositoryC',
+        *,
+        c_snapshot: 'GitConfigC',
+    ) -> None:
+        """For internal use only.
+
+        See :meth:`BaseRepository.config_snapshot` for obtaining a repository
+        configuration snapshot.
+
+        Constructs a ``RepositoryConfig`` from a given snapshot config object pointer.
+        The resulting configuration will be read-only.
+        """
+        ...
+
+    def __init__(
+        self,
+        repo: 'BaseRepository',
+        c_repo: 'GitRepositoryC',
+        *,
+        do_snapshot: bool = False,
+        c_snapshot: 'GitConfigC | None' = None,
+    ) -> None:
+        self._repo = repo
+        self._c_repo = c_repo
+        self._backend_added = False
+        self._backend = RepositoryConfig._InMemoryBackend(self)
+
+        if c_snapshot is not None:
+            super().__init__(c_config=c_snapshot, is_snapshot=True)
+        else:
+            c_config = ffi.new('git_config **')
+            if do_snapshot:
+                err = C.git_repository_config_snapshot(c_config, self._c_repo)
+            else:
+                err = C.git_repository_config(c_config, self._c_repo)
+            check_error(err)
+            super().__init__(c_config=c_config[0], is_snapshot=do_snapshot)
+
+    @override
+    def snapshot(self) -> RepositoryConfig:
+        """Create a read-only snapshot of this ``RepositoryConfig`` object.
+
+        This means that looking up multiple values will use the same version
+        of the configuration files. The resulting ``RepositoryConfig`` cannot be
+        used as a context manager, because it is read-only.
+
+        Raises ``TypeError`` if this is already a snapshot.
+        """
+        if self._is_snapshot:
+            raise TypeError('This repository config is already a snapshot.')
+        return RepositoryConfig(self._repo, self._c_repo, c_snapshot=self._c_snapshot())
+
+    def __enter__(self) -> Self:
+        """Enter a context where all writes occur against an in-memory configuration.
+
+        When entered, all subsequent writes occur against an in-memory configuration
+        backend and do not get persisted to the repository's underlying config file.
+        As long as the context endures, repository operations will use the sum total
+        configuration that includes the in-memory configuration.
+
+        Raises ``TypeError`` if this is a read-only snapshot of the local configuration.
+        """
+        if self._is_snapshot:
+            raise TypeError(
+                'A read-only repository config snapshot cannot be used as a context manager, '
+                'because its backend data cannot be changed.'
+            )
+        if not self._backend_added:
+            self._backend.add_to_config(self._config, self._c_repo)
+            self._backend_added = True
+        self._change_write_priority(ConfigLevel.APP)
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> Literal[False]:
+        """Exit the context so that writes occur against the repository config again.
+
+        When exited, any in-memory configuration is erased so that it is no longer
+        effective for repository operations, and subsequent writes again occur against
+        the repository's config and persist to the repository's config file.
+        """
+        if self._backend_added:
+            self._change_write_priority(ConfigLevel.LOCAL)
+            self._backend.clear()
+        return False
+
+    def _change_write_priority(self, level: ConfigLevel) -> None:
+        """For internal use only.
+
+        By default, when libgit2 creates a ``git_config`` object for a repository, it sets
+        the write order to ``{ GIT_CONFIG_LEVEL_LOCAL }``. This means that writes go
+        only to the local config in ``.git/config`` and nowhere else. We need to change
+        this to ``{ GIT_CONFIG_LEVEL_APP }` when entering the context and then back to
+        ``{ GIT_CONFIG_LEVEL_LOCAL }`` when exiting the context.
+        """
+        c_levels = ffi.new(
+            'git_config_level_t[]',
+            [ffi.cast('git_config_level_t', level.value)],
+        )
+        err = C.git_config_set_writeorder(self._config, c_levels, 1)
+        check_error(err)
+
+    class _InMemoryBackend:
+        """For internal use only.
+
+        An in-memory ``git_config_backend`` implementing the details of
+        ``_pygit_in_memory_backend``. libgit2 has a built-in in-memory backend that can
+        be constructed with (as of 1.9.5) ``git_config_backend_from_string`` or
+        ``git_config_backend_from_values``, but that backend is read-only and cannot
+        be mutated. To implement the semantics of temporary app-level configuration
+        in :class:`RepositoryConfiguration`, we need to implement our own backend.
+
+        We could do so completely in C, but that has some serious downsides, notably
+        all the memory management and how easy it is to get wrong and either leak or
+        segfault. It's easier, and safer, to implement the backend primarily in Python,
+        using C structs and CFFI to bridge the implementation so that libgit2 C code
+        can call its member functions.
+
+        Because of the way CFFI works, the `member` functions must be standalone
+        functions and cannot be member functions of this class. See all of the
+        ``_config_memory_*`` functions below.
+        """
+
+        type_string = cast('char_pointer', ffi.new('char[]', b'in-memory'))
+        origin_path_string = cast('char_pointer', ffi.new('char[]', b''))
+
+        def __init__(self, config: RepositoryConfig) -> None:
+            self._config = config
+
+            self._read_data: dict[
+                str, list[RepositoryConfig._InMemoryBackend._Entry]
+            ] = {}
+            self._write_data: dict[
+                str, list[RepositoryConfig._InMemoryBackend._Entry]
+            ] = self._read_data
+
+            self._locked = False
+            self._readers_lock = threading.Lock()
+            self._write_lock = threading.Lock()
+            self._locked_write_lock = threading.Lock()
+            self._readers = 0
+
+            self._c_backend: 'PyGitConfigBackendWrapperC | None' = None
+            self._c_handle = ffi.new_handle(self)
+
+            self._iterators: dict[int, RepositoryConfig._InMemoryBackend._Iterator] = {}
+            self._c_entries: dict[int, 'PyGitConfigBackendEntryC'] = {}
+
+        @contextlib.contextmanager
+        def read_lock(self) -> Generator[None, None, None]:
+            """For internal use only.
+
+            Yield a lock to protect `_read_data`. The lock will not block other readers
+            from simultaneously reading `_read_data`. The lock will prevent writers from
+            mutating `_write_data` unless this backend is "locked" (in the midst of a
+            transaction).
+            """
+            with self._readers_lock:
+                self._readers += 1
+                if self._readers == 1:
+                    self._write_lock.acquire()  # first reader blocks all writers
+
+            try:
+                yield
+            finally:
+                with self._readers_lock:
+                    self._readers -= 1
+                    if self._readers == 0:
+                        self._write_lock.release()  # last reader unblocks all writers
+
+        @contextlib.contextmanager
+        def write_lock(self) -> Generator[None, None, None]:
+            """For internal use only.
+
+            If this backend is "locked" (in the midst of a transaction), yield a lock
+            to protect `_write_data`, which is a separate object from `_read_data`, and
+            so it won't block readers. If this backend is not "locked," yield a lock to
+            protect `_write_data`/`_read_data`, which are the same object, and so it
+            will block readers.
+            """
+            if self._locked:
+                with self._locked_write_lock:
+                    yield
+            else:
+                with self._write_lock:
+                    yield
+
+        def add_to_config(
+            self,
+            c_config: 'GitConfigC',
+            c_repo: 'GitRepositoryC',
+        ) -> None:
+            """For internal use only.
+
+            Adds the backend to the repository's `git_config`. Called by
+            :meth:`RepositoryConfig.__enter__` the first time it enters, but not any
+            subsequent times. This is because it's not possible to remove a backend
+            from a config with libgit2's public API, and so we rely on clearing
+            the backend's contents on `__exit__`.
+            """
+            if self._c_backend is not None:
+                raise ValueError('add_to_config called twice')
+
+            self._c_backend = ffi.new('_pygit_in_memory_backend *')
+            assert self._c_backend is not None
+            self._c_backend.self = self._c_handle
+            self._c_backend.parent.version = 1
+            self._c_backend.parent.readonly = 0
+            self._c_backend.parent.open = C._config_memory_backend_open
+            self._c_backend.parent.get = C._config_memory_backend_get
+            self._c_backend.parent.set = C._config_memory_backend_set
+            self._c_backend.parent.set_multivar = C._config_memory_backend_set_multivar
+            setattr(self._c_backend.parent, 'del', C._config_memory_backend_del)
+            self._c_backend.parent.del_multivar = C._config_memory_backend_del_multivar
+            self._c_backend.parent.iterator = C._config_memory_backend_iterator
+            self._c_backend.parent.snapshot = C._config_memory_backend_snapshot
+            self._c_backend.parent.lock = C._config_memory_backend_lock
+            self._c_backend.parent.unlock = C._config_memory_backend_unlock
+            self._c_backend.parent.free = C._config_memory_backend_free
+
+            err = C.git_config_add_backend(
+                c_config,
+                ffi.cast('git_config_backend *', self._c_backend),
+                ConfigLevel.APP.value,
+                c_repo,
+                1,  # force
+            )
+            check_error(err)
+
+        def clear(self) -> None:
+            """For internal use only.
+
+            Erases all contents of the backend. Called by
+            :meth:`RepositoryConfig.__exit__` each time it exits.
+            """
+            with self.write_lock():
+                self._read_data.clear()
+                self._write_data.clear()
+                self._iterators.clear()
+                self._c_entries.clear()
+
+        def _multivar_generator(
+            self,
+        ) -> Generator[
+            tuple[str, 'RepositoryConfig._InMemoryBackend._Entry'],
+            None,
+            None,
+        ]:
+            """For internal use only.
+
+            Creates a generator yielding the contents of this backend for use by a
+            :class:`RepositoryConfig._InMemoryBackend._Iterator`.
+            """
+            for key in self._read_data.keys():
+                for value in self._read_data[key]:
+                    yield key, value
+
+        class _Entry:
+            """For internal use only.
+
+            The value stored in ``_read_data`` and ``_write_data`` to prolong the life of
+            C strings until their corresponding values are removed or the backend is
+            cleared or freed.
+            """
+
+            def __init__(self, name: str, value: str) -> None:
+                self.name = name
+                self.c_name = cast(
+                    'char_pointer',
+                    ffi.new('char[]', name.encode('utf-8')),
+                )
+                self.value = value
+                self.c_value = cast(
+                    'char_pointer',
+                    ffi.new('char[]', value.encode('utf-8')),
+                )
+
+            def __repr__(self):
+                return (
+                    f'_Entry("{ffi.string(self.c_name).decode("utf-8")}", '
+                    f'"{ffi.string(self.c_value).decode("utf-8")}")'
+                )
+
+        class _Iterator:
+            """For internal use only.
+
+            Backs the ``_pygit_in_memory_backend_iterator`` object.
+            """
+
+            def __init__(
+                self,
+                backend: RepositoryConfig._InMemoryBackend,
+                c_iterator: 'PyGitConfigIteratorWrapperC',
+            ) -> None:
+                self._backend = backend
+                self._generator = backend._multivar_generator()
+                self._c_handle = ffi.new_handle(self)
+                self._c_iterator = c_iterator
+                self._c_entries: dict[int, 'PyGitConfigIteratorEntryC'] = {}
+
+            def __next__(self) -> tuple[str, RepositoryConfig._InMemoryBackend._Entry]:
+                return next(self._generator)
+
+            def __enter__(self) -> Self:
+                self._backend._iterators[id(self)] = self
+                return self
+
+            def __exit__(
+                self,
+                exc_type: type[BaseException] | None,
+                exc_val: BaseException | None,
+                exc_tb: TracebackType | None,
+            ) -> Literal[False]:
+                self._backend._iterators.pop(id(self), None)
+                return False
+
+
+def _populate_memory_backend_entry(
+    entry: 'GitConfigBackendEntryC',
+    source: RepositoryConfig._InMemoryBackend._Entry,
+    free: Callable[[GitConfigBackendEntryC], None],
+) -> None:
+    """For internal use only.
+
+    Helper function used by ``_config_memory_backend_get`` and
+    ``_config_memory_iterator_next`` to populate an entry with the data from the
+    backend.
+    """
+    entry.free = free
+    entry.entry.name = source.c_name
+    entry.entry.value = source.c_value
+    entry.entry.backend_type = RepositoryConfig._InMemoryBackend.type_string
+    entry.entry.origin_path = RepositoryConfig._InMemoryBackend.origin_path_string
+    entry.entry.include_depth = 0
+    entry.entry.level = ConfigLevel.APP.value
+
+
+@ffi.def_extern()
+def _config_memory_backend_open(
+    _: 'GitConfigBackendC',
+    __: int,
+    ___: 'GitRepositoryC',
+) -> int:
+    """For internal use only.
+
+    'Member' function of the ``_pygit_in_memory_backend`` struct, invoked by libgit2
+    immediately after a backend is constructed. In our case, this doesn't need to do
+    anything, because Python manages the backend instance and all of its data
+    structures.
+
+    C signature:
+        int open(
+            git_config_backend *backend,
+            git_config_level_t level,
+            const git_repository *repo);
+    """
+    return 0
+
+
+@ffi.def_extern()
+def _config_memory_backend_get(
+    backend: 'GitConfigBackendC',
+    name: char_pointer,
+    out: '_Pointer[GitConfigBackendEntryC]',
+) -> int:
+    """For internal use only.
+
+    'Member' function of the ``_pygit_in_memory_backend`` struct, invoked by libgit2
+    on each of a config's backends, in order of level, until a backend returns
+    something other than ``GIT_ENOTFOUND``. If a match is found for ``name``, constructs
+    a ``_pygit_in_memory_backend_entry``, stores it in the ``_Backend`` to prevent
+    destruction, and returns 0.
+
+    Obtains a read lock to prevent writers from mutating the backend while it is
+    being read.
+
+    C signature:
+        int get(
+            git_config_backend *backend,
+            const char *name,
+            git_config_backend_entry **entry);
+    """
+    backend_wrapper = ffi.cast('_pygit_in_memory_backend *', backend)
+    self = cast(
+        RepositoryConfig._InMemoryBackend,
+        ffi.from_handle(backend_wrapper.self),
+    )
+    try:
+        key = ffi.string(name).decode('utf-8')
+        if key not in self._read_data or not self._read_data[key]:
+            return C.GIT_ENOTFOUND
+
+        value = self._read_data[key][0]
+        entry = ffi.new('_pygit_in_memory_backend_entry *')
+        ptr = int(ffi.cast('uintptr_t', entry))
+        entry.owner = backend_wrapper
+        _populate_memory_backend_entry(
+            entry.parent,
+            value,
+            C._config_memory_backend_entry_free,
+        )
+        self._c_entries[ptr] = entry
+        out[0] = ffi.cast('git_config_backend_entry *', entry)
+    except BaseException as e:
+        self._config._stored_exception = e
+        return C.GIT_EUSER
+    return 0
+
+
+@ffi.def_extern()
+def _config_memory_backend_set(
+    backend: 'GitConfigBackendC',
+    name: char_pointer,
+    value: char_pointer,
+) -> int:
+    """For internal use only.
+
+    'Member' function of the ``_pygit_in_memory_backend`` struct, invoked by libgit2
+    on the config's first non-read-only backend (in the order defined by
+    ``git_config_set_writeorder``) when other code calls ``git_config_set_*`` on that
+    config. Replaces all values at the specified ``name`` with the new ``value``.
+
+    Obtains a write lock to prevent readers from reading the backend while it is
+    being mutated.
+
+    C signature:
+        int set(git_config_backend *backend, const char *name, const char *value);
+    """
+    backend_wrapper = ffi.cast('_pygit_in_memory_backend *', backend)
+    self = cast(
+        RepositoryConfig._InMemoryBackend,
+        ffi.from_handle(backend_wrapper.self),
+    )
+    try:
+        key = ffi.string(name).decode('utf-8')
+        decoded_value = ffi.string(value).decode('utf-8')
+        self._write_data[key] = [
+            RepositoryConfig._InMemoryBackend._Entry(key, decoded_value),
+        ]
+    except BaseException as e:
+        self._config._stored_exception = e
+        return C.GIT_EUSER
+    return 0
+
+
+@ffi.def_extern()
+def _config_memory_backend_set_multivar(
+    backend: 'GitConfigBackendC',
+    name: char_pointer,
+    regexp: char_pointer,
+    value: char_pointer,
+) -> int:
+    """For internal use only.
+
+    'Member' function of the ``_pygit_in_memory_backend`` struct, invoked by libgit2
+    on the config's first non-read-only backend (in the order defined by
+    ``git_config_set_writeorder``) when other code calls ``git_config_set_multivar`` on
+    that config. If no current values with the given ``name`` exist, creates a new
+    multivar. Appends the ``value`` to the multivar and, if ``regexp`` is not ``NULL``,
+    removes all other values that match the regular expression case-sensitively.
+
+    Obtains a write lock to prevent readers from reading the backend while it is
+    being mutated.
+
+    C signature:
+        int set_multivar(
+            git_config_backend *,
+            const char *name,
+            const char *regexp,
+            const char *value);
+    """
+    backend_wrapper = ffi.cast('_pygit_in_memory_backend *', backend)
+    self = cast(
+        RepositoryConfig._InMemoryBackend,
+        ffi.from_handle(backend_wrapper.self),
+    )
+    try:
+        key = ffi.string(name).decode('utf-8')
+        with self.write_lock():
+            if key in self._write_data and regexp != ffi.NULL:
+                expression = re.compile(ffi.string(regexp).decode('utf-8'))
+                self._write_data[key] = [
+                    v for v in self._write_data[key] if not expression.search(v.value)
+                ]
+            elif key not in self._write_data:
+                self._write_data[key] = []
+            self._write_data[key].append(
+                RepositoryConfig._InMemoryBackend._Entry(
+                    key,
+                    ffi.string(value).decode('utf-8'),
+                ),
+            )
+    except BaseException as e:
+        self._config._stored_exception = e
+        return C.GIT_EUSER
+    return 0
+
+
+@ffi.def_extern()
+def _config_memory_backend_del(
+    backend: 'GitConfigBackendC',
+    name: char_pointer,
+) -> int:
+    """For internal use only.
+
+    'Member' function of the ``_pygit_in_memory_backend`` struct, invoked by libgit2
+    on the config's first non-read-only backend (in the order defined by
+    ``git_config_set_writeorder``) when other code calls ``git_config_delete_entry`` on
+    that config. Deletes all values with the specified name.
+
+    Obtains a write lock to prevent readers from reading the backend while it is
+    being mutated.
+
+    C signature:
+        int del(git_config_backend *backend, const char *name);
+    """
+    backend_wrapper = ffi.cast('_pygit_in_memory_backend *', backend)
+    self = cast(
+        RepositoryConfig._InMemoryBackend,
+        ffi.from_handle(backend_wrapper.self),
+    )
+    try:
+        key = ffi.string(name).decode('utf-8')
+        with self.write_lock():
+            if key not in self._write_data:
+                return C.GIT_ENOTFOUND
+            del self._write_data[key]
+    except BaseException as e:
+        self._config._stored_exception = e
+        return C.GIT_EUSER
+    return 0
+
+
+@ffi.def_extern()
+def _config_memory_backend_del_multivar(
+    backend: 'GitConfigBackendC',
+    name: char_pointer,
+    regexp: char_pointer,
+) -> int:
+    """For internal use only.
+
+    'Member' function of the ``_pygit_in_memory_backend`` struct, invoked by libgit2
+    on all of a config's non-read-only backends when other code calls
+    ``git_config_delete_multivar`` on that config. If the ``regexp`` is ``NULL``,
+    deletes all values with the specified ``name``. Otherwise, deletes any values
+    with the specified ``name`` that match the regular expression case-sensitively.
+
+    Obtains a write lock to prevent readers from reading the backend while it is
+    being mutated.
+
+    C signature:
+        int del_multivar(git_config_backend *backend, const char *name, const char *regexp);
+    """
+    backend_wrapper = ffi.cast('_pygit_in_memory_backend *', backend)
+    self = cast(
+        RepositoryConfig._InMemoryBackend,
+        ffi.from_handle(backend_wrapper.self),
+    )
+    try:
+        key = ffi.string(name).decode('utf-8')
+        with self.write_lock():
+            if key not in self._write_data:
+                return C.GIT_ENOTFOUND
+            if regexp == ffi.NULL:
+                del self._write_data[key]
+            else:
+                expression = re.compile(ffi.string(regexp).decode('utf-8'))
+                self._write_data[key] = [
+                    v for v in self._write_data[key] if not expression.search(v.value)
+                ]
+    except BaseException as e:
+        self._config._stored_exception = e
+        return C.GIT_EUSER
+    return 0
+
+
+@ffi.def_extern()
+def _config_memory_backend_iterator(
+    out: '_Pointer[GitConfigIteratorC]',
+    backend: 'GitConfigBackendC',
+) -> int:
+    """For internal use only.
+
+    'Member' function of the ``_pygit_in_memory_backend`` struct, invoked by libgit2
+    on all of a config's backends when other code calls ``git_config_iterator_new`` or
+    ``git_config_multivar_iterator_new`` on that config followed by ``git_config_next``
+    on the resulting iterator.
+
+    Here's how it works:
+    - User code (or, in this case, :meth:`Config.__iter__` or :meth:`Config.get_multivar`)
+      calls ``git_config_iterator_new`` or ``git_config_multivar_iterator_new``.
+    - libgit2 creates a special config iterator that wraps underlying backend iterators
+      for all the backends backing the config.
+    - User code (or, in this case, :meth:`ConfigIterator.__next__`) calls
+      ``git_config_next`` on that config iterator.
+    - libgit2 invokes this function on the highest-level backend to create the backend
+      iterator, then immediately invokes ``next`` on that backend iterator to obtain the
+      first entry.
+    - libgit2 continues to invoke ``next`` on the backend iterator each time user code
+      calls ``git_config_next`` on the config iterator, until the backend iterator returns
+      ``GIT_ITEROVER``.
+    - libgit2 then invokes this function on the next-higest-level backend to create the
+      next backend iterator, and so on.
+    - The config iterator returns ``GIT_ITEROVER`` to the user code only once all backends
+      have been iterated.
+
+    This constructs a :class:`RepositoryConfig._InMemoryBackend._Iterator` and a
+    ``_pygit_in_memory_backend_iterator`` and stores references to each in the other,
+    then enters the former's context manager to prepare for iteration.
+
+    Does not obtain a lock. The only safe way to iterate a backend is to create a
+    snapshot of the config.
+
+    C signature:
+        int iterator(git_config_iterator **out, git_config_backend * backend);
+    """
+    backend_wrapper = ffi.cast('_pygit_in_memory_backend *', backend)
+    self = cast(
+        RepositoryConfig._InMemoryBackend,
+        ffi.from_handle(backend_wrapper.self),
+    )
+
+    try:
+        iterator = ffi.new('_pygit_in_memory_backend_iterator *')
+        py_iterator = RepositoryConfig._InMemoryBackend._Iterator(self, iterator)
+        iterator.self = py_iterator._c_handle
+        iterator.parent.backend = backend
+        iterator.parent.flags = 0
+        iterator.parent.next = C._config_memory_iterator_next
+        iterator.parent.free = C._config_memory_iterator_free
+        out[0] = ffi.cast('git_config_iterator *', iterator)
+
+        py_iterator.__enter__()
+    except BaseException as e:
+        self._config._stored_exception = e
+        return C.GIT_EUSER
+
+    return 0
+
+
+@ffi.def_extern()
+def _config_memory_backend_snapshot(
+    _: '_Pointer[GitConfigBackendC]',
+    __: 'GitConfigBackendC',
+) -> int:
+    """For internal use only.
+
+    'Member' function of the ``_pygit_in_memory_backend`` struct, invoked by libgit2
+    on all of a config's backends when other code calls ``git_config_snapshot`` on
+    that config.
+
+    TODO: Implement this, the easiest way for which will be to use
+    ``git_config_backend_from_string`` (an immutable in-memory backend) when it becomes
+    available in 1.9.5.
+
+    C signature:
+        int snapshot(git_config_backend **out, git_config_backend *backend);
+    """
+    # backend_wrapper = ffi.cast('_pygit_in_memory_backend *', backend)
+    # self = cast(
+    #     RepositoryConfig._InMemoryBackend,
+    #     ffi.from_handle(backend_wrapper.self),
+    # )
+    return C.GIT_PASSTHROUGH
+
+
+@ffi.def_extern()
+def _config_memory_backend_lock(backend: 'GitConfigBackendC') -> int:
+    """For internal use only.
+
+    'Member' function of the ``_pygit_in_memory_backend`` struct, invoked by libgit2
+    on all of a config's non-read-only backends when other code calls
+    ``git_config_lock`` on that config to begin a transaction. In practice, this is
+    not currently used, as PyGit2 does not (yet?) support config transactions.
+
+    This sets ``_write_data`` to a deep copy of the current value of ``_read_data``
+    so that any changes made to ``_write_data`` during the transaction are not
+    visible to readers unless and until ``unlock(true)`` is called.
+
+    C signature:
+        int lock(git_config_backend * backend);
+    """
+    backend_wrapper = ffi.cast('_pygit_in_memory_backend *', backend)
+    self = cast(
+        RepositoryConfig._InMemoryBackend,
+        ffi.from_handle(backend_wrapper.self),
+    )
+    try:
+        with self.write_lock():
+            if self._locked:
+                return C.GIT_ELOCKED
+            self._locked = True
+            # this will return a different lock because _locked changed
+            with self.write_lock():
+                self._write_data = {k: v[:] for k, v in self._read_data.items()}
+    except BaseException as e:
+        self._config._stored_exception = e
+        return C.GIT_EUSER
+    return 0
+
+
+@ffi.def_extern()
+def _config_memory_backend_unlock(backend: 'GitConfigBackendC', success: int) -> int:
+    """For internal use only.
+
+    'Member' function of the ``_pygit_in_memory_backend`` struct, invoked by libgit2
+    on all of a config's non-read-only backends when other code calls
+    ``git_transaction_commit`` or ``git_transaction_free`` on a transaction obtained
+    from ``git_config_lock``. If ``git_transaction_commit` was called, this function
+    is invoked with a true ``success`` value. If ``git_transaction_free`` is called
+    without ``git_transaction_commit`` having first been called, this function is
+    invoked with a false ``success`` value. In practice, this is not currently used,
+    as PyGit2 does not (yet?) support config transactions.
+
+    If ``success`` is true (non-zero), this "commits" all changes made during the lock
+    period by pointing ``_read_data`` to ``_write_data``, thus discarding the contents
+    of ``_read_data``. If ``success`` is false (zero), this "rolls back" all changes
+    made during the lock period by pointing ``_write_data`` to ``_read_data``, thus
+    discarding the contents of ``_write_data``.
+
+    C signature:
+        int unlock(git_config_backend * backend, int success);
+    """
+    backend_wrapper = ffi.cast('_pygit_in_memory_backend *', backend)
+    self = cast(
+        RepositoryConfig._InMemoryBackend,
+        ffi.from_handle(backend_wrapper.self),
+    )
+    try:
+        with self.write_lock():
+            if not self._locked:
+                return C.GIT_EINVALID
+            self._locked = False
+            # this will return a different lock because _locked changed
+            with self.write_lock():
+                if success == 0:
+                    self._write_data = self._read_data
+                else:
+                    self._read_data = self._write_data
+    except BaseException as e:
+        self._config._stored_exception = e
+        return C.GIT_EUSER
+    return 0
+
+
+@ffi.def_extern()
+def _config_memory_backend_free(backend: 'GitConfigBackendC') -> None:
+    """For internal use only.
+
+    'Member' function of the ``_pygit_in_memory_backend`` struct, invoked by libgit2
+    when it discards the in-memory backend. This occurs only when the repository
+    config is freed, which is only when the repository itself is freed.
+
+    C signature:
+        void free(git_config_backend *backend);
+    """
+    backend_wrapper = ffi.cast('_pygit_in_memory_backend *', backend)
+    self = cast(
+        RepositoryConfig._InMemoryBackend,
+        ffi.from_handle(backend_wrapper.self),
+    )
+    try:
+        self.clear()
+    except BaseException as e:
+        self._config._stored_exception = e
+        # nothing we can do here because of the void return type
+
+
+@ffi.def_extern()
+def _config_memory_backend_entry_free(entry: 'GitConfigBackendEntryC') -> None:
+    """For internal use only.
+
+    'Member' function of the ``_pygit_in_memory_backend_entry`` struct, invoked
+    by libgit2 when it discards an entry obtained from ``_config_memory_backend_get``
+    (and, in this specific case, by :meth:`ConfigEntry.__del__` when it calls
+    ``git_config_entry_free``).
+
+    Removes the entry previously stored in :class:`RepostiroyConfig._InMemoryBackend`'s
+    store of ``git_config_backend_entry`` instances.
+
+    C signature:
+        void free(git_config_backend_entry *entry);
+    """
+    sub_entry = ffi.cast('_pygit_in_memory_backend_entry *', entry)
+    self = cast(
+        RepositoryConfig._InMemoryBackend,
+        ffi.from_handle(sub_entry.owner.self),
+    )
+    try:
+        ptr = int(ffi.cast('uintptr_t', entry))
+        if ptr in self._c_entries:
+            del self._c_entries[ptr]
+    except BaseException as e:
+        self._config._stored_exception = e
+        # nothing we can do here because of the void return type
+
+
+@ffi.def_extern()
+def _config_memory_iterator_next(
+    out: '_Pointer[GitConfigBackendEntryC]',
+    iterator: 'GitConfigIteratorC',
+) -> int:
+    """For internal use only.
+
+    'Member' function of the ``_pygit_in_memory_backend_iterator`` struct, invoked
+    by libgit2 when it wants the next entry from the iterator (and, in this specific
+    case, by :meth:`ConfigIterator.__next__` when it calls ``git_config_next``).
+
+    C signature:
+        int next(git_config_backend_entry **out, git_config_iterator *iterator);
+    """
+    iterator_wrapper = ffi.cast('_pygit_in_memory_backend_iterator *', iterator)
+    self = cast(
+        RepositoryConfig._InMemoryBackend._Iterator,
+        ffi.from_handle(iterator_wrapper.self),
+    )
+    try:
+        key, value = next(self)
+        entry = ffi.new('_pygit_in_memory_backend_iterator_entry *')
+        ptr = int(ffi.cast('uintptr_t', entry))
+        entry.owner = iterator_wrapper
+        _populate_memory_backend_entry(
+            entry.parent,
+            value,
+            C._config_memory_iterator_entry_free,
+        )
+        self._c_entries[ptr] = entry
+        out[0] = ffi.cast('git_config_backend_entry *', entry)
+        return 0
+    except StopIteration:
+        return C.GIT_ITEROVER
+    except BaseException as e:
+        self._backend._config._stored_exception = e
+        return C.GIT_EUSER
+
+
+@ffi.def_extern()
+def _config_memory_iterator_free(iterator: 'GitConfigIteratorC') -> None:
+    """For internal use only.
+
+    'Member' function of the ``_pygit_in_memory_backend_iterator`` struct, invoked
+    by libgit2 when it discards an iterator (and, in this specific case, by
+    :meth:`ConfigIterator.__del__` when it calls ``git_config_iterator_free``).
+
+    Exits the :class:`RepositoryConfig._InMemoryBackend._Iterator`'s context manager
+    so that it releases its reference to the backend, the
+    ``_pygit_in_memory_backend_iterator`` instance, and the
+    ``git_config_backend_entry`` instances it stored.
+
+    C signature:
+        void free(git_config_iterator *iterator);
+    """
+    iterator_wrapper = ffi.cast('_pygit_in_memory_backend_iterator *', iterator)
+    self = cast(
+        RepositoryConfig._InMemoryBackend._Iterator,
+        ffi.from_handle(iterator_wrapper.self),
+    )
+    try:
+        self.__exit__(None, None, None)
+    except BaseException as e:
+        self._backend._config._stored_exception = e
+        # nothing we can do here because of the void return type
+
+
+@ffi.def_extern()
+def _config_memory_iterator_entry_free(entry: 'GitConfigBackendEntryC') -> None:
+    """For internal use only.
+
+    'Member' function of the ``_pygit_in_memory_backend_iterator_entry`` struct, invoked
+    by libgit2 when it discards an entry obtained from an iterator (and, in this
+    specific case, by :meth:`ConfigEntry.__del__` when it calls
+    ``git_config_entry_free``).
+
+    Removes the entry previously stored in
+    :class:`RepostiroyConfig._InMemoryBackend._Iterator`'s store of
+    ``git_config_backend_entry`` instances.
+
+    C signature:
+        void free(git_config_backend_entry *entry);
+    """
+    sub_entry = ffi.cast('_pygit_in_memory_backend_iterator_entry *', entry)
+    self = cast(
+        RepositoryConfig._InMemoryBackend._Iterator,
+        ffi.from_handle(sub_entry.owner.self),
+    )
+    try:
+        ptr = int(ffi.cast('uintptr_t', entry))
+        if ptr in self._c_entries:
+            del self._c_entries[ptr]
+    except BaseException as e:
+        self._backend._config._stored_exception = e
+        # nothing we can do here because of the void return type
 
 
 class ConfigEntry:
@@ -396,7 +1498,7 @@ class ConfigEntry:
         return entry
 
     def __del__(self) -> None:
-        if self.iterator is None:
+        if self.iterator is None and self._entry != ffi.NULL:
             C.git_config_entry_free(self._entry)
 
     @property

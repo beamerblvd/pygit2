@@ -28,7 +28,14 @@ from pathlib import Path
 
 import pytest
 
-from pygit2 import Config, Repository, Settings
+from pygit2 import (
+    Config,
+    DefaultConfig,
+    GitError,
+    Repository,
+    RepositoryConfig,
+    Settings,
+)
 
 from . import utils
 
@@ -39,7 +46,7 @@ def config_path(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def config(testrepo: Repository) -> Generator[Config, None, None]:
+def config(testrepo: Repository) -> Generator[RepositoryConfig, None, None]:
     yield testrepo.config
 
 
@@ -60,6 +67,12 @@ def test_system_config() -> None:
         assert Config.get_system_config() is not None
     except IOError as e:
         pytest.skip(f'Unavailable for testing: {e}')
+
+
+def test_default_config() -> None:
+    # this shouldn't throw, even if get_global_config and git_system_config don't find configs
+    config = DefaultConfig()
+    assert 'pygit2.test.default.config' not in config
 
 
 def test_new(config_path: Path) -> None:
@@ -220,7 +233,8 @@ def test_parsing() -> None:
     assert 1024 == Config.parse_int('1k')
 
 
-def test_repository_config_snapshot(config: Config) -> None:
+def test_repository_config_snapshot(config: RepositoryConfig) -> None:
+    assert not config.is_snapshot
     assert 'core.bare' in config
     assert not config.get_bool('core.bare')
     assert 'core.editor' in config
@@ -229,12 +243,19 @@ def test_repository_config_snapshot(config: Config) -> None:
     assert config.get_int('core.repositoryformatversion') == 0
 
     snapshot = config.snapshot()
+    assert not config.is_snapshot
+    assert snapshot.is_snapshot
     assert 'core.bare' in snapshot
     assert not snapshot.get_bool('core.bare')
     assert 'core.editor' in snapshot
     assert snapshot['core.editor'] == 'ed'
     assert 'core.repositoryformatversion' in snapshot
     assert snapshot.get_int('core.repositoryformatversion') == 0
+    utils.assertRaisesWithArg(
+        GitError,
+        "cannot set 'something.other.changed': the configuration is read-only",
+        lambda: snapshot.set_multivar('something.other.changed', '^$', 'foo'),
+    )
 
     assert 'core.snapshot1' not in config
     assert 'core.snapshot1' not in snapshot
@@ -255,16 +276,24 @@ def test_non_repository_config_snapshot(config_path: Path) -> None:
         new_file.write('[something "other"]\n\there = false')
 
     config = Config(config_path)
+    assert not config.is_snapshot
     assert 'this.that' in config
     assert config.get_bool('this.that')
     assert 'something.other.here' in config
     assert not config.get_bool('something.other.here')
 
     snapshot = config.snapshot()
+    assert not config.is_snapshot
+    assert snapshot.is_snapshot
     assert 'this.that' in snapshot
     assert snapshot.get_bool('this.that')
     assert 'something.other.here' in snapshot
     assert not snapshot.get_bool('something.other.here')
+    utils.assertRaisesWithArg(
+        GitError,
+        "cannot set 'something.other.changed': the configuration is read-only",
+        lambda: snapshot.set_multivar('something.other.changed', '^$', 'foo'),
+    )
 
     assert 'this.snapshot1' not in config
     assert 'this.snapshot1' not in snapshot
@@ -277,3 +306,144 @@ def test_non_repository_config_snapshot(config_path: Path) -> None:
         'this.snapshot1',
         lambda: snapshot.get_int('this.snapshot1'),
     )
+
+
+def test_default_config_snapshot() -> None:
+    config = DefaultConfig()
+    assert not config.is_snapshot
+    snapshot = config.snapshot()
+    assert not config.is_snapshot
+    assert snapshot.is_snapshot
+    utils.assertRaisesWithArg(
+        GitError,
+        "cannot set 'something.other.changed': the configuration is read-only",
+        lambda: snapshot.set_multivar('something.other.changed', '^$', 'foo'),
+    )
+
+
+def test_repository_config_in_memory_overrides(config: RepositoryConfig) -> None:
+    assert not config.is_snapshot
+    assert 'core.bare' in config
+    assert not config.get_bool('core.bare')
+    assert 'core.editor' in config
+    assert config['core.editor'] == 'ed'
+    assert 'core.repositoryformatversion' in config
+    assert config.get_int('core.repositoryformatversion') == 0
+
+    assert 'core.override1' not in config
+    assert 'core.override2' not in config
+    assert 'core.override3' not in config
+    assert 'core.override4' not in config
+    assert 'core.local1' not in config
+    assert 'core.local2' not in config
+    assert 'core.local3' not in config
+
+    with config:
+        # these should be unaffected
+        assert 'core.bare' in config
+        assert not config.get_bool('core.bare')
+        assert 'core.editor' in config
+        assert config['core.editor'] == 'ed'
+        assert 'core.repositoryformatversion' in config
+        assert config.get_int('core.repositoryformatversion') == 0
+
+        # now we should be able to add these to the local in-memory config
+        assert 'core.override1' not in config
+        config['core.override1'] = True
+        assert 'core.override1' in config
+        assert config.get_bool('core.override1')
+
+        assert 'core.override2' not in config
+        config['core.override2'] = 42
+        assert 'core.override2' in config
+        assert config.get_int('core.override2') == 42
+
+        assert 'core.override3' not in config
+        config['core.override3'] = 'foo'
+        assert 'core.override3' in config
+        assert config['core.override3'] == 'foo'
+
+        assert 'core.override4' not in config
+        config.set_multivar('core.override4', '^$', 'bar')
+        assert 'core.override4' in config
+        assert list(config.get_multivar('core.override4')) == ['bar']
+        config.set_multivar('core.override4', '^$', 'baz')
+        assert list(config.get_multivar('core.override4')) == ['bar', 'baz']
+        config.set_multivar('core.override4', '^ba', 'qux')
+        assert list(config.get_multivar('core.override4')) == ['qux']
+
+        # these should not have been added yet
+        assert 'core.local1' not in config
+        assert 'core.local2' not in config
+        assert 'core.local3' not in config
+
+    # it all should have been erased
+    assert 'core.override1' not in config
+    assert 'core.override2' not in config
+    assert 'core.override3' not in config
+    assert 'core.override4' not in config
+
+    # now let's add our local configs to the actual file backend
+    assert 'core.local1' not in config
+    config['core.local1'] = False
+    assert 'core.local1' in config
+    assert not config.get_bool('core.local1')
+    assert 'core.local2' not in config
+    config['core.local2'] = 56
+    assert 'core.local2' in config
+    assert config.get_int('core.local2') == 56
+    assert 'core.local3' not in config
+    config['core.local3'] = 'lorem ipsum'
+    assert 'core.local3' in config
+    assert config['core.local3'] == 'lorem ipsum'
+
+    with config:
+        # these should be unaffected
+        assert 'core.bare' in config
+        assert not config.get_bool('core.bare')
+        assert 'core.editor' in config
+        assert config['core.editor'] == 'ed'
+        assert 'core.repositoryformatversion' in config
+        assert config.get_int('core.repositoryformatversion') == 0
+        assert 'core.local1' in config
+        assert not config.get_bool('core.local1')
+        assert 'core.local2' in config
+        assert config.get_int('core.local2') == 56
+        assert 'core.local3' in config
+        assert config['core.local3'] == 'lorem ipsum'
+
+        # let's try some different values now
+        assert 'core.override1' not in config
+        config['core.override1'] = False
+        assert 'core.override1' in config
+        assert not config.get_bool('core.override1')
+
+        assert 'core.override2' not in config
+        config['core.override2'] = 81
+        assert 'core.override2' in config
+        assert config.get_int('core.override2') == 81
+
+        assert 'core.override3' not in config
+        config['core.override3'] = 'dolor simet'
+        assert 'core.override3' in config
+        assert config['core.override3'] == 'dolor simet'
+
+    # it all should have been erased again
+    assert 'core.override1' not in config
+    assert 'core.override2' not in config
+    assert 'core.override3' not in config
+    assert 'core.override4' not in config
+
+    # but these should not have been erased
+    assert 'core.bare' in config
+    assert not config.get_bool('core.bare')
+    assert 'core.editor' in config
+    assert config['core.editor'] == 'ed'
+    assert 'core.repositoryformatversion' in config
+    assert config.get_int('core.repositoryformatversion') == 0
+    assert 'core.local1' in config
+    assert not config.get_bool('core.local1')
+    assert 'core.local2' in config
+    assert config.get_int('core.local2') == 56
+    assert 'core.local3' in config
+    assert config['core.local3'] == 'lorem ipsum'
