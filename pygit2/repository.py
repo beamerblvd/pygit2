@@ -295,7 +295,7 @@ class BaseRepository(_Repository):
         present on the system, with the local repository config set to the highest
         priority for reads and the only option for writes.
 
-        If the configuration hasn't been set yet, the default config for
+        If the configuration hasn't been set yet, the default config for the
         repository will be created and returned.
         """
         return RepositoryConfig(self, self._repo)

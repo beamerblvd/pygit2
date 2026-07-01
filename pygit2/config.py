@@ -135,8 +135,7 @@ class Config:
     def __init__(self, /):
         """Constructs a new, empty ``Config`` object pointing to no file.
 
-        To persist changes made to this ``Config`` object, you must use
-        :meth:`Config.add_file`.
+        To make changes to this ``Config`` object, you must use :meth:`Config.add_file`.
         """
         ...
 
@@ -174,16 +173,16 @@ class Config:
         if c_config is not None:
             self._config = c_config
         else:
-            cconfig = ffi.new('git_config **')
+            c_config_ptr = ffi.new('git_config **')
 
             if not path:
-                err = C.git_config_new(cconfig)
+                err = C.git_config_new(c_config_ptr)
             else:
                 path_bytes = to_bytes(path)
-                err = C.git_config_open_ondisk(cconfig, path_bytes)
+                err = C.git_config_open_ondisk(c_config_ptr, path_bytes)
 
             check_error(err, io=True)
-            self._config = cconfig[0]
+            self._config = c_config_ptr[0]
 
     def __del__(self) -> None:
         try:
@@ -380,6 +379,8 @@ class Config:
 
         This means that looking up multiple values will use the same version
         of the configuration files.
+
+        Raises ``TypeError`` if this is already a snapshot.
         """
         if self._is_snapshot:
             raise TypeError('This config is already a snapshot.')
@@ -472,7 +473,7 @@ class DefaultConfig(Config):
 
     The ``DefaultConfig`` includes the program, system, XDG, and global (user) configurations.
     This is, in essence, the "effective" configuration that Git uses when performing
-    operations that are not against a repository. When a read operations occurs, the
+    operations that are not against a repository. When a read operation occurs, the
     configurations are searched in the following order: global (user), XDG, system,
     and then program data.
     """
@@ -535,10 +536,11 @@ class RepositoryConfig(Config):
     in-memory override of the local configuration. When the context manager is entered,
     an empty in-memory configuration backend is assigned to the configuration and given
     the highest read priority. During this context, write operations change the in-memory
-    backend and do not affect the local configuration file. Read operations consult the
-    in-memory backend first before then consulting the usual order. When the context
-    manager exits, the in-memory backend is erased, undoing any changes made to it and
-    allowing write operations to resume affecting the local configuration.
+    backend and do not affect the local configuration file. Read operations—including those
+    performed by Git itself—consult the in-memory backend first before then consulting the
+    usual order. When the context manager exits, the in-memory backend is erased, undoing
+    any changes made to it and allowing write operations to resume affecting the local
+    configuration.
 
     The context manager can be re-entered and then re-exited repeatedly; it is not a
     one-use-only operation.
@@ -699,7 +701,7 @@ class RepositoryConfig(Config):
         ``_config_memory_*`` functions below.
         """
 
-        type_string = cast('char_pointer', ffi.new('char[]', b'in-memory'))
+        type_string = cast('char_pointer', ffi.new('char[]', b'pygit2-in-memory'))
         origin_path_string = cast('char_pointer', ffi.new('char[]', b''))
 
         def __init__(self, config: RepositoryConfig) -> None:
@@ -728,9 +730,9 @@ class RepositoryConfig(Config):
         def read_lock(self) -> Generator[None, None, None]:
             """For internal use only.
 
-            Yield a lock to protect `_read_data`. The lock will not block other readers
-            from simultaneously reading `_read_data`. The lock will prevent writers from
-            mutating `_write_data` unless this backend is "locked" (in the midst of a
+            Yield a lock to protect ``_read_data``. The lock will not block other readers
+            from simultaneously reading ``_read_data`` but will prevent writers from
+            mutating ``_write_data`` unless this backend is "locked" (in the midst of a
             transaction).
             """
             with self._readers_lock:
@@ -751,10 +753,10 @@ class RepositoryConfig(Config):
             """For internal use only.
 
             If this backend is "locked" (in the midst of a transaction), yield a lock
-            to protect `_write_data`, which is a separate object from `_read_data`, and
-            so it won't block readers. If this backend is not "locked," yield a lock to
-            protect `_write_data`/`_read_data`, which are the same object, and so it
-            will block readers.
+            to protect ``_write_data``, which is a separate object from ``_read_data``
+            (so it won't block readers). If this backend is not "locked," yield a lock
+            to protect ``_write_data``/``_read_data``, which are the same object (so it
+            will block readers).
             """
             if self._locked:
                 with self._locked_write_lock:
@@ -770,11 +772,11 @@ class RepositoryConfig(Config):
         ) -> None:
             """For internal use only.
 
-            Adds the backend to the repository's `git_config`. Called by
+            Adds the backend to the repository's ``git_config``. Called by
             :meth:`RepositoryConfig.__enter__` the first time it enters, but not any
             subsequent times. This is because it's not possible to remove a backend
             from a config with libgit2's public API, and so we rely on clearing
-            the backend's contents on `__exit__`.
+            the backend's contents on ``__exit__``.
             """
             if self._c_backend is not None:
                 raise ValueError('add_to_config called twice')
@@ -788,6 +790,7 @@ class RepositoryConfig(Config):
             self._c_backend.parent.get = C._config_memory_backend_get
             self._c_backend.parent.set = C._config_memory_backend_set
             self._c_backend.parent.set_multivar = C._config_memory_backend_set_multivar
+            # this unfortunate name conflicts with a Python keyword, so we must use setattr
             setattr(self._c_backend.parent, 'del', C._config_memory_backend_del)
             self._c_backend.parent.del_multivar = C._config_memory_backend_del_multivar
             self._c_backend.parent.iterator = C._config_memory_backend_iterator
@@ -801,7 +804,7 @@ class RepositoryConfig(Config):
                 ffi.cast('git_config_backend *', self._c_backend),
                 ConfigLevel.APP.value,
                 c_repo,
-                1,  # force
+                1,  # force=true
             )
             check_error(err)
 
@@ -926,6 +929,9 @@ def _config_memory_backend_open(
     immediately after a backend is constructed. In our case, this doesn't need to do
     anything, because Python manages the backend instance and all of its data
     structures.
+
+    The third argument, ``repo``, may be ``NULL`` if this backend was applied to
+    other than a repository config.
 
     C signature:
         int open(

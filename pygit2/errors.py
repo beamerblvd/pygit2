@@ -42,8 +42,6 @@ def check_error(
 
     if err == C.GIT_EUSER and user_exception:
         raise user_exception
-        # may need this? depends on whether this raise "adds to" or "replaces" the traceback:
-        #   raise user_exception.with_traceback(user_exception.__traceback__)
 
     # These are special error codes, they should never reach here
     test = err != C.GIT_EUSER and err != C.GIT_PASSTHROUGH

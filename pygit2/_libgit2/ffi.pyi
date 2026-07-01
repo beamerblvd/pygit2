@@ -60,6 +60,8 @@ class ssize_t:
 class uintptr_t:
     def __int__(self) -> int: ...
 
+class git_config_level_t(int): ...
+
 class _Pointer(Generic[T]):
     def __setitem__(self, item: Literal[0], a: T) -> None: ...
     @overload
@@ -226,6 +228,7 @@ class GitConfigBackendC:
     set_multivar: Callable[
         [GitConfigBackendC, char_pointer, char_pointer, char_pointer], int
     ]
+    # this unfortunate name is actually `del`, but that conflicts with a Python keyword
     del_: Callable[[GitConfigBackendC, char_pointer], int]
     del_multivar: Callable[[GitConfigBackendC, char_pointer, char_pointer], int]
     iterator: Callable[[_Pointer[GitConfigIteratorC], GitConfigBackendC], int]
@@ -412,18 +415,21 @@ def new(a: Literal['git_config_backend **']) -> _Pointer[GitConfigBackendC]: ...
 def new(a: Literal['git_config_backend_entry *']) -> GitConfigBackendEntryC: ...
 @overload
 def new(
+    a: Literal['git_config_backend_memory_options *'],
+) -> GitConfigBackendMemoryOptionsC: ...
+@overload
+def new(
+    a: Literal['git_config_level_t[]'],
+    b: list[git_config_level_t],
+) -> list[git_config_level_t]: ...
+@overload
+def new(
     a: Literal['_pygit_in_memory_backend_entry *'],
 ) -> PyGitConfigBackendEntryC: ...
 @overload
 def new(
     a: Literal['_pygit_in_memory_backend_iterator_entry *'],
 ) -> PyGitConfigIteratorEntryC: ...
-@overload
-def new(
-    a: Literal['git_config_backend_memory_options *'],
-) -> GitConfigBackendMemoryOptionsC: ...
-@overload
-def new(a: Literal['git_config_level_t[]'], b: list[int]) -> list[int]: ...
 @overload
 def new(a: Literal['_pygit_in_memory_backend *']) -> PyGitConfigBackendWrapperC: ...
 @overload
@@ -521,7 +527,7 @@ def cast(a: Literal['char *'], b: object) -> char_pointer: ...
 @overload
 def cast(a: Literal['uintptr_t'], b: object) -> uintptr_t: ...
 @overload
-def cast(a: Literal['git_config_level_t'], b: int) -> int: ...
+def cast(a: Literal['git_config_level_t'], b: int) -> git_config_level_t: ...
 @overload
 def cast(
     a: Literal['git_config_backend *'],
