@@ -599,7 +599,7 @@ class RepositoryConfig(Config):
         self._repo = repo
         self._c_repo = c_repo
         self._backend_added = False
-        self._backend = RepositoryConfig._InMemoryBackend(self)
+        self._backend = _InMemoryBackend(self)
 
         if c_snapshot is not None:
             super().__init__(c_config=c_snapshot, is_snapshot=True)
@@ -680,226 +680,219 @@ class RepositoryConfig(Config):
         err = C.git_config_set_writeorder(self._config, c_levels, 1)
         check_error(err)
 
-    class _InMemoryBackend:
+
+class _InMemoryBackend:
+    """For internal use only.
+
+    An in-memory ``git_config_backend`` implementing the details of
+    ``_pygit_in_memory_backend``. libgit2 has a built-in in-memory backend that can
+    be constructed with (as of 1.9.5) ``git_config_backend_from_string`` or
+    ``git_config_backend_from_values``, but that backend is read-only and cannot
+    be mutated. To implement the semantics of temporary app-level configuration
+    in :class:`RepositoryConfiguration`, we need to implement our own backend.
+
+    We could do so completely in C, but that has some serious downsides, notably
+    all the memory management and how easy it is to get wrong and either leak or
+    segfault. It's easier, and safer, to implement the backend primarily in Python,
+    using C structs and CFFI to bridge the implementation so that libgit2 C code
+    can call its member functions.
+
+    Because of the way CFFI works, the `member` functions must be standalone
+    functions and cannot be member functions of this class. See all of the
+    ``_config_memory_*`` functions below.
+    """
+
+    type_string = cast('char_pointer', ffi.new('char[]', b'pygit2-in-memory'))
+    origin_path_string = cast('char_pointer', ffi.new('char[]', b''))
+
+    def __init__(self, config: RepositoryConfig) -> None:
+        self._config = config
+
+        self._read_data: dict[str, list[_InMemoryBackend.Entry]] = {}
+        self._write_data: dict[str, list[_InMemoryBackend.Entry]] = self._read_data
+
+        self._locked = False
+        self._readers_lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._locked_write_lock = threading.Lock()
+        self._readers = 0
+
+        self._c_backend: 'PyGitConfigBackendWrapperC | None' = None
+        self._c_handle = ffi.new_handle(self)
+
+        self._iterators: dict[int, _InMemoryBackend.Iterator] = {}
+        self._c_entries: dict[int, 'PyGitConfigBackendEntryC'] = {}
+
+    @contextlib.contextmanager
+    def read_lock(self) -> Generator[None, None, None]:
         """For internal use only.
 
-        An in-memory ``git_config_backend`` implementing the details of
-        ``_pygit_in_memory_backend``. libgit2 has a built-in in-memory backend that can
-        be constructed with (as of 1.9.5) ``git_config_backend_from_string`` or
-        ``git_config_backend_from_values``, but that backend is read-only and cannot
-        be mutated. To implement the semantics of temporary app-level configuration
-        in :class:`RepositoryConfiguration`, we need to implement our own backend.
+        Yield a lock to protect ``_read_data``. The lock will not block other readers
+        from simultaneously reading ``_read_data`` but will prevent writers from
+        mutating ``_write_data`` unless this backend is "locked" (in the midst of a
+        transaction).
+        """
+        with self._readers_lock:
+            self._readers += 1
+            if self._readers == 1:
+                self._write_lock.acquire()  # first reader blocks all writers
 
-        We could do so completely in C, but that has some serious downsides, notably
-        all the memory management and how easy it is to get wrong and either leak or
-        segfault. It's easier, and safer, to implement the backend primarily in Python,
-        using C structs and CFFI to bridge the implementation so that libgit2 C code
-        can call its member functions.
+        try:
+            yield
+        finally:
+            with self._readers_lock:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._write_lock.release()  # last reader unblocks all writers
 
-        Because of the way CFFI works, the `member` functions must be standalone
-        functions and cannot be member functions of this class. See all of the
-        ``_config_memory_*`` functions below.
+    @contextlib.contextmanager
+    def write_lock(self) -> Generator[None, None, None]:
+        """For internal use only.
+
+        If this backend is "locked" (in the midst of a transaction), yield a lock
+        to protect ``_write_data``, which is a separate object from ``_read_data``
+        (so it won't block readers). If this backend is not "locked," yield a lock
+        to protect ``_write_data``/``_read_data``, which are the same object (so it
+        will block readers).
+        """
+        if self._locked:
+            with self._locked_write_lock:
+                yield
+        else:
+            with self._write_lock:
+                yield
+
+    def add_to_config(
+        self,
+        c_config: 'GitConfigC',
+        c_repo: 'GitRepositoryC',
+    ) -> None:
+        """For internal use only.
+
+        Adds the backend to the repository's ``git_config``. Called by
+        :meth:`RepositoryConfig.__enter__` the first time it enters, but not any
+        subsequent times. This is because it's not possible to remove a backend
+        from a config with libgit2's public API, and so we rely on clearing
+        the backend's contents on ``__exit__``.
+        """
+        if self._c_backend is not None:
+            raise ValueError('add_to_config called twice')
+
+        self._c_backend = ffi.new('_pygit_in_memory_backend *')
+        assert self._c_backend is not None
+        self._c_backend.self = self._c_handle
+        self._c_backend.parent.version = 1
+        self._c_backend.parent.readonly = 0
+        self._c_backend.parent.open = C._config_memory_backend_open
+        self._c_backend.parent.get = C._config_memory_backend_get
+        self._c_backend.parent.set = C._config_memory_backend_set
+        self._c_backend.parent.set_multivar = C._config_memory_backend_set_multivar
+        # this unfortunate name conflicts with a Python keyword, so we must use setattr
+        setattr(self._c_backend.parent, 'del', C._config_memory_backend_del)
+        self._c_backend.parent.del_multivar = C._config_memory_backend_del_multivar
+        self._c_backend.parent.iterator = C._config_memory_backend_iterator
+        self._c_backend.parent.snapshot = C._config_memory_backend_snapshot
+        self._c_backend.parent.lock = C._config_memory_backend_lock
+        self._c_backend.parent.unlock = C._config_memory_backend_unlock
+        self._c_backend.parent.free = C._config_memory_backend_free
+
+        err = C.git_config_add_backend(
+            c_config,
+            ffi.cast('git_config_backend *', self._c_backend),
+            ConfigLevel.APP.value,
+            c_repo,
+            1,  # force=true
+        )
+        check_error(err)
+
+    def clear(self) -> None:
+        """For internal use only.
+
+        Erases all contents of the backend. Called by
+        :meth:`RepositoryConfig.__exit__` each time it exits.
+        """
+        with self.write_lock():
+            self._read_data.clear()
+            self._write_data.clear()
+            self._iterators.clear()
+            self._c_entries.clear()
+
+    def _multivar_generator(
+        self,
+    ) -> Generator[tuple[str, '_InMemoryBackend.Entry'], None, None]:
+        """For internal use only.
+
+        Creates a generator yielding the contents of this backend for use by a
+        :class:`_InMemoryBackend.Iterator`.
+        """
+        with self.read_lock():
+            for key in self._read_data.keys():
+                for value in self._read_data[key]:
+                    yield key, value
+
+    class Entry:
+        """For internal use only.
+
+        The value stored in ``_read_data`` and ``_write_data`` to prolong the life of
+        C strings until their corresponding values are removed or the backend is
+        cleared or freed.
         """
 
-        type_string = cast('char_pointer', ffi.new('char[]', b'pygit2-in-memory'))
-        origin_path_string = cast('char_pointer', ffi.new('char[]', b''))
-
-        def __init__(self, config: RepositoryConfig) -> None:
-            self._config = config
-
-            self._read_data: dict[
-                str, list[RepositoryConfig._InMemoryBackend._Entry]
-            ] = {}
-            self._write_data: dict[
-                str, list[RepositoryConfig._InMemoryBackend._Entry]
-            ] = self._read_data
-
-            self._locked = False
-            self._readers_lock = threading.Lock()
-            self._write_lock = threading.Lock()
-            self._locked_write_lock = threading.Lock()
-            self._readers = 0
-
-            self._c_backend: 'PyGitConfigBackendWrapperC | None' = None
-            self._c_handle = ffi.new_handle(self)
-
-            self._iterators: dict[int, RepositoryConfig._InMemoryBackend._Iterator] = {}
-            self._c_entries: dict[int, 'PyGitConfigBackendEntryC'] = {}
-
-        @contextlib.contextmanager
-        def read_lock(self) -> Generator[None, None, None]:
-            """For internal use only.
-
-            Yield a lock to protect ``_read_data``. The lock will not block other readers
-            from simultaneously reading ``_read_data`` but will prevent writers from
-            mutating ``_write_data`` unless this backend is "locked" (in the midst of a
-            transaction).
-            """
-            with self._readers_lock:
-                self._readers += 1
-                if self._readers == 1:
-                    self._write_lock.acquire()  # first reader blocks all writers
-
-            try:
-                yield
-            finally:
-                with self._readers_lock:
-                    self._readers -= 1
-                    if self._readers == 0:
-                        self._write_lock.release()  # last reader unblocks all writers
-
-        @contextlib.contextmanager
-        def write_lock(self) -> Generator[None, None, None]:
-            """For internal use only.
-
-            If this backend is "locked" (in the midst of a transaction), yield a lock
-            to protect ``_write_data``, which is a separate object from ``_read_data``
-            (so it won't block readers). If this backend is not "locked," yield a lock
-            to protect ``_write_data``/``_read_data``, which are the same object (so it
-            will block readers).
-            """
-            if self._locked:
-                with self._locked_write_lock:
-                    yield
-            else:
-                with self._write_lock:
-                    yield
-
-        def add_to_config(
-            self,
-            c_config: 'GitConfigC',
-            c_repo: 'GitRepositoryC',
-        ) -> None:
-            """For internal use only.
-
-            Adds the backend to the repository's ``git_config``. Called by
-            :meth:`RepositoryConfig.__enter__` the first time it enters, but not any
-            subsequent times. This is because it's not possible to remove a backend
-            from a config with libgit2's public API, and so we rely on clearing
-            the backend's contents on ``__exit__``.
-            """
-            if self._c_backend is not None:
-                raise ValueError('add_to_config called twice')
-
-            self._c_backend = ffi.new('_pygit_in_memory_backend *')
-            assert self._c_backend is not None
-            self._c_backend.self = self._c_handle
-            self._c_backend.parent.version = 1
-            self._c_backend.parent.readonly = 0
-            self._c_backend.parent.open = C._config_memory_backend_open
-            self._c_backend.parent.get = C._config_memory_backend_get
-            self._c_backend.parent.set = C._config_memory_backend_set
-            self._c_backend.parent.set_multivar = C._config_memory_backend_set_multivar
-            # this unfortunate name conflicts with a Python keyword, so we must use setattr
-            setattr(self._c_backend.parent, 'del', C._config_memory_backend_del)
-            self._c_backend.parent.del_multivar = C._config_memory_backend_del_multivar
-            self._c_backend.parent.iterator = C._config_memory_backend_iterator
-            self._c_backend.parent.snapshot = C._config_memory_backend_snapshot
-            self._c_backend.parent.lock = C._config_memory_backend_lock
-            self._c_backend.parent.unlock = C._config_memory_backend_unlock
-            self._c_backend.parent.free = C._config_memory_backend_free
-
-            err = C.git_config_add_backend(
-                c_config,
-                ffi.cast('git_config_backend *', self._c_backend),
-                ConfigLevel.APP.value,
-                c_repo,
-                1,  # force=true
+        def __init__(self, name: str, value: str) -> None:
+            self.name = name
+            self.c_name = cast(
+                'char_pointer',
+                ffi.new('char[]', name.encode('utf-8')),
             )
-            check_error(err)
+            self.value = value
+            self.c_value = cast(
+                'char_pointer',
+                ffi.new('char[]', value.encode('utf-8')),
+            )
 
-        def clear(self) -> None:
-            """For internal use only.
+        def __repr__(self):
+            return (
+                f'Entry("{ffi.string(self.c_name).decode("utf-8")}", '
+                f'"{ffi.string(self.c_value).decode("utf-8")}")'
+            )
 
-            Erases all contents of the backend. Called by
-            :meth:`RepositoryConfig.__exit__` each time it exits.
-            """
-            with self.write_lock():
-                self._read_data.clear()
-                self._write_data.clear()
-                self._iterators.clear()
-                self._c_entries.clear()
+    class Iterator:
+        """For internal use only.
 
-        def _multivar_generator(
+        Backs the ``_pygit_in_memory_backend_iterator`` object.
+        """
+
+        def __init__(
             self,
-        ) -> Generator[
-            tuple[str, 'RepositoryConfig._InMemoryBackend._Entry'],
-            None,
-            None,
-        ]:
-            """For internal use only.
+            backend: _InMemoryBackend,
+            c_iterator: 'PyGitConfigIteratorWrapperC',
+        ) -> None:
+            self._backend = backend
+            self._generator = backend._multivar_generator()
+            self._c_handle = ffi.new_handle(self)
+            self._c_iterator = c_iterator
+            self._c_entries: dict[int, 'PyGitConfigIteratorEntryC'] = {}
 
-            Creates a generator yielding the contents of this backend for use by a
-            :class:`RepositoryConfig._InMemoryBackend._Iterator`.
-            """
-            with self.read_lock():
-                for key in self._read_data.keys():
-                    for value in self._read_data[key]:
-                        yield key, value
+        def __next__(self) -> tuple[str, _InMemoryBackend.Entry]:
+            return next(self._generator)
 
-        class _Entry:
-            """For internal use only.
+        def __enter__(self) -> Self:
+            self._backend._iterators[id(self)] = self
+            return self
 
-            The value stored in ``_read_data`` and ``_write_data`` to prolong the life of
-            C strings until their corresponding values are removed or the backend is
-            cleared or freed.
-            """
-
-            def __init__(self, name: str, value: str) -> None:
-                self.name = name
-                self.c_name = cast(
-                    'char_pointer',
-                    ffi.new('char[]', name.encode('utf-8')),
-                )
-                self.value = value
-                self.c_value = cast(
-                    'char_pointer',
-                    ffi.new('char[]', value.encode('utf-8')),
-                )
-
-            def __repr__(self):
-                return (
-                    f'_Entry("{ffi.string(self.c_name).decode("utf-8")}", '
-                    f'"{ffi.string(self.c_value).decode("utf-8")}")'
-                )
-
-        class _Iterator:
-            """For internal use only.
-
-            Backs the ``_pygit_in_memory_backend_iterator`` object.
-            """
-
-            def __init__(
-                self,
-                backend: RepositoryConfig._InMemoryBackend,
-                c_iterator: 'PyGitConfigIteratorWrapperC',
-            ) -> None:
-                self._backend = backend
-                self._generator = backend._multivar_generator()
-                self._c_handle = ffi.new_handle(self)
-                self._c_iterator = c_iterator
-                self._c_entries: dict[int, 'PyGitConfigIteratorEntryC'] = {}
-
-            def __next__(self) -> tuple[str, RepositoryConfig._InMemoryBackend._Entry]:
-                return next(self._generator)
-
-            def __enter__(self) -> Self:
-                self._backend._iterators[id(self)] = self
-                return self
-
-            def __exit__(
-                self,
-                exc_type: type[BaseException] | None,
-                exc_val: BaseException | None,
-                exc_tb: TracebackType | None,
-            ) -> Literal[False]:
-                self._backend._iterators.pop(id(self), None)
-                return False
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_val: BaseException | None,
+            exc_tb: TracebackType | None,
+        ) -> Literal[False]:
+            self._backend._iterators.pop(id(self), None)
+            return False
 
 
 def _populate_memory_backend_entry(
     entry: 'GitConfigBackendEntryC',
-    source: RepositoryConfig._InMemoryBackend._Entry,
+    source: _InMemoryBackend.Entry,
     free: Callable[[GitConfigBackendEntryC], None],
 ) -> None:
     """For internal use only.
@@ -911,8 +904,8 @@ def _populate_memory_backend_entry(
     entry.free = free
     entry.entry.name = source.c_name
     entry.entry.value = source.c_value
-    entry.entry.backend_type = RepositoryConfig._InMemoryBackend.type_string
-    entry.entry.origin_path = RepositoryConfig._InMemoryBackend.origin_path_string
+    entry.entry.backend_type = _InMemoryBackend.type_string
+    entry.entry.origin_path = _InMemoryBackend.origin_path_string
     entry.entry.include_depth = 0
     entry.entry.level = ConfigLevel.APP.value
 
@@ -966,10 +959,7 @@ def _config_memory_backend_get(
             git_config_backend_entry **entry);
     """
     backend_wrapper = ffi.cast('_pygit_in_memory_backend *', backend)
-    self = cast(
-        RepositoryConfig._InMemoryBackend,
-        ffi.from_handle(backend_wrapper.self),
-    )
+    self = cast(_InMemoryBackend, ffi.from_handle(backend_wrapper.self))
     try:
         key = ffi.string(name).decode('utf-8')
         if key not in self._read_data or not self._read_data[key]:
@@ -1012,16 +1002,11 @@ def _config_memory_backend_set(
         int set(git_config_backend *backend, const char *name, const char *value);
     """
     backend_wrapper = ffi.cast('_pygit_in_memory_backend *', backend)
-    self = cast(
-        RepositoryConfig._InMemoryBackend,
-        ffi.from_handle(backend_wrapper.self),
-    )
+    self = cast(_InMemoryBackend, ffi.from_handle(backend_wrapper.self))
     try:
         key = ffi.string(name).decode('utf-8')
         decoded_value = ffi.string(value).decode('utf-8')
-        self._write_data[key] = [
-            RepositoryConfig._InMemoryBackend._Entry(key, decoded_value),
-        ]
+        self._write_data[key] = [_InMemoryBackend.Entry(key, decoded_value)]
     except BaseException as e:
         self._config._stored_exception = e
         return C.GIT_EUSER
@@ -1055,10 +1040,7 @@ def _config_memory_backend_set_multivar(
             const char *value);
     """
     backend_wrapper = ffi.cast('_pygit_in_memory_backend *', backend)
-    self = cast(
-        RepositoryConfig._InMemoryBackend,
-        ffi.from_handle(backend_wrapper.self),
-    )
+    self = cast(_InMemoryBackend, ffi.from_handle(backend_wrapper.self))
     try:
         key = ffi.string(name).decode('utf-8')
         with self.write_lock():
@@ -1070,10 +1052,7 @@ def _config_memory_backend_set_multivar(
             elif key not in self._write_data:
                 self._write_data[key] = []
             self._write_data[key].append(
-                RepositoryConfig._InMemoryBackend._Entry(
-                    key,
-                    ffi.string(value).decode('utf-8'),
-                ),
+                _InMemoryBackend.Entry(key, ffi.string(value).decode('utf-8')),
             )
     except BaseException as e:
         self._config._stored_exception = e
@@ -1100,10 +1079,7 @@ def _config_memory_backend_del(
         int del(git_config_backend *backend, const char *name);
     """
     backend_wrapper = ffi.cast('_pygit_in_memory_backend *', backend)
-    self = cast(
-        RepositoryConfig._InMemoryBackend,
-        ffi.from_handle(backend_wrapper.self),
-    )
+    self = cast(_InMemoryBackend, ffi.from_handle(backend_wrapper.self))
     try:
         key = ffi.string(name).decode('utf-8')
         with self.write_lock():
@@ -1137,10 +1113,7 @@ def _config_memory_backend_del_multivar(
         int del_multivar(git_config_backend *backend, const char *name, const char *regexp);
     """
     backend_wrapper = ffi.cast('_pygit_in_memory_backend *', backend)
-    self = cast(
-        RepositoryConfig._InMemoryBackend,
-        ffi.from_handle(backend_wrapper.self),
-    )
+    self = cast(_InMemoryBackend, ffi.from_handle(backend_wrapper.self))
     try:
         key = ffi.string(name).decode('utf-8')
         with self.write_lock():
@@ -1189,7 +1162,7 @@ def _config_memory_backend_iterator(
     - The config iterator returns ``GIT_ITEROVER`` to the user code only once all backends
       have been iterated.
 
-    This constructs a :class:`RepositoryConfig._InMemoryBackend._Iterator` and a
+    This constructs a :class:`_InMemoryBackend.Iterator` and a
     ``_pygit_in_memory_backend_iterator`` and stores references to each in the other,
     then enters the former's context manager to prepare for iteration.
 
@@ -1200,26 +1173,20 @@ def _config_memory_backend_iterator(
         int iterator(git_config_iterator **out, git_config_backend * backend);
     """
     backend_wrapper = ffi.cast('_pygit_in_memory_backend *', backend)
-    self = cast(
-        RepositoryConfig._InMemoryBackend,
-        ffi.from_handle(backend_wrapper.self),
-    )
-
+    self = cast(_InMemoryBackend, ffi.from_handle(backend_wrapper.self))
     try:
         iterator = ffi.new('_pygit_in_memory_backend_iterator *')
-        py_iterator = RepositoryConfig._InMemoryBackend._Iterator(self, iterator)
+        py_iterator = _InMemoryBackend.Iterator(self, iterator)
         iterator.self = py_iterator._c_handle
         iterator.parent.backend = backend
         iterator.parent.flags = 0
         iterator.parent.next = C._config_memory_iterator_next
         iterator.parent.free = C._config_memory_iterator_free
         out[0] = ffi.cast('git_config_iterator *', iterator)
-
         py_iterator.__enter__()
     except BaseException as e:
         self._config._stored_exception = e
         return C.GIT_EUSER
-
     return 0
 
 
@@ -1242,10 +1209,7 @@ def _config_memory_backend_snapshot(
         int snapshot(git_config_backend **out, git_config_backend *backend);
     """
     # backend_wrapper = ffi.cast('_pygit_in_memory_backend *', backend)
-    # self = cast(
-    #     RepositoryConfig._InMemoryBackend,
-    #     ffi.from_handle(backend_wrapper.self),
-    # )
+    # self = cast(_InMemoryBackend, ffi.from_handle(backend_wrapper.self))
     return C.GIT_PASSTHROUGH
 
 
@@ -1266,10 +1230,7 @@ def _config_memory_backend_lock(backend: 'GitConfigBackendC') -> int:
         int lock(git_config_backend * backend);
     """
     backend_wrapper = ffi.cast('_pygit_in_memory_backend *', backend)
-    self = cast(
-        RepositoryConfig._InMemoryBackend,
-        ffi.from_handle(backend_wrapper.self),
-    )
+    self = cast(_InMemoryBackend, ffi.from_handle(backend_wrapper.self))
     try:
         with self.write_lock():
             if self._locked:
@@ -1307,10 +1268,7 @@ def _config_memory_backend_unlock(backend: 'GitConfigBackendC', success: int) ->
         int unlock(git_config_backend * backend, int success);
     """
     backend_wrapper = ffi.cast('_pygit_in_memory_backend *', backend)
-    self = cast(
-        RepositoryConfig._InMemoryBackend,
-        ffi.from_handle(backend_wrapper.self),
-    )
+    self = cast(_InMemoryBackend, ffi.from_handle(backend_wrapper.self))
     try:
         with self.write_lock():
             if not self._locked:
@@ -1340,10 +1298,7 @@ def _config_memory_backend_free(backend: 'GitConfigBackendC') -> None:
         void free(git_config_backend *backend);
     """
     backend_wrapper = ffi.cast('_pygit_in_memory_backend *', backend)
-    self = cast(
-        RepositoryConfig._InMemoryBackend,
-        ffi.from_handle(backend_wrapper.self),
-    )
+    self = cast(_InMemoryBackend, ffi.from_handle(backend_wrapper.self))
     try:
         self.clear()
     except BaseException as e:
@@ -1360,17 +1315,14 @@ def _config_memory_backend_entry_free(entry: 'GitConfigBackendEntryC') -> None:
     (and, in this specific case, by :meth:`ConfigEntry.__del__` when it calls
     ``git_config_entry_free``).
 
-    Removes the entry previously stored in :class:`RepostiroyConfig._InMemoryBackend`'s
-    store of ``git_config_backend_entry`` instances.
+    Removes the entry previously stored in :class:`_InMemoryBackend`'s store of
+    ``git_config_backend_entry`` instances.
 
     C signature:
         void free(git_config_backend_entry *entry);
     """
     sub_entry = ffi.cast('_pygit_in_memory_backend_entry *', entry)
-    self = cast(
-        RepositoryConfig._InMemoryBackend,
-        ffi.from_handle(sub_entry.owner.self),
-    )
+    self = cast(_InMemoryBackend, ffi.from_handle(sub_entry.owner.self))
     try:
         ptr = int(ffi.cast('uintptr_t', entry))
         if ptr in self._c_entries:
@@ -1395,10 +1347,7 @@ def _config_memory_iterator_next(
         int next(git_config_backend_entry **out, git_config_iterator *iterator);
     """
     iterator_wrapper = ffi.cast('_pygit_in_memory_backend_iterator *', iterator)
-    self = cast(
-        RepositoryConfig._InMemoryBackend._Iterator,
-        ffi.from_handle(iterator_wrapper.self),
-    )
+    self = cast(_InMemoryBackend.Iterator, ffi.from_handle(iterator_wrapper.self))
     try:
         key, value = next(self)
         entry = ffi.new('_pygit_in_memory_backend_iterator_entry *')
@@ -1427,19 +1376,15 @@ def _config_memory_iterator_free(iterator: 'GitConfigIteratorC') -> None:
     by libgit2 when it discards an iterator (and, in this specific case, by
     :meth:`ConfigIterator.__del__` when it calls ``git_config_iterator_free``).
 
-    Exits the :class:`RepositoryConfig._InMemoryBackend._Iterator`'s context manager
-    so that it releases its reference to the backend, the
-    ``_pygit_in_memory_backend_iterator`` instance, and the
-    ``git_config_backend_entry`` instances it stored.
+    Exits the :class:`_InMemoryBackend.Iterator`'s context manager so that it
+    releases its reference to the backend, the ``_pygit_in_memory_backend_iterator``
+    instance, and the ``git_config_backend_entry`` instances it stored.
 
     C signature:
         void free(git_config_iterator *iterator);
     """
     iterator_wrapper = ffi.cast('_pygit_in_memory_backend_iterator *', iterator)
-    self = cast(
-        RepositoryConfig._InMemoryBackend._Iterator,
-        ffi.from_handle(iterator_wrapper.self),
-    )
+    self = cast(_InMemoryBackend.Iterator, ffi.from_handle(iterator_wrapper.self))
     try:
         self.__exit__(None, None, None)
     except BaseException as e:
@@ -1456,18 +1401,14 @@ def _config_memory_iterator_entry_free(entry: 'GitConfigBackendEntryC') -> None:
     specific case, by :meth:`ConfigEntry.__del__` when it calls
     ``git_config_entry_free``).
 
-    Removes the entry previously stored in
-    :class:`RepostiroyConfig._InMemoryBackend._Iterator`'s store of
-    ``git_config_backend_entry`` instances.
+    Removes the entry previously stored in :class:`_InMemoryBackend.Iterator`'s store
+    of ``git_config_backend_entry`` instances.
 
     C signature:
         void free(git_config_backend_entry *entry);
     """
     sub_entry = ffi.cast('_pygit_in_memory_backend_iterator_entry *', entry)
-    self = cast(
-        RepositoryConfig._InMemoryBackend._Iterator,
-        ffi.from_handle(sub_entry.owner.self),
-    )
+    self = cast(_InMemoryBackend.Iterator, ffi.from_handle(sub_entry.owner.self))
     try:
         ptr = int(ffi.cast('uintptr_t', entry))
         if ptr in self._c_entries:
