@@ -381,6 +381,8 @@ class Config:
         This means that looking up multiple values will use the same version
         of the configuration files.
         """
+        if self._is_snapshot:
+            raise TypeError('This config is already a snapshot.')
         return Config(c_config=self._c_snapshot(), is_snapshot=True)
 
     def _c_snapshot(self) -> 'GitConfigC':
@@ -537,6 +539,9 @@ class RepositoryConfig(Config):
     in-memory backend first before then consulting the usual order. When the context
     manager exits, the in-memory backend is erased, undoing any changes made to it and
     allowing write operations to resume affecting the local configuration.
+
+    The context manager can be re-entered and then re-exited repeatedly; it is not a
+    one-use-only operation.
 
     Only writeable ``RepositoryConfig`` objects can be used as a context manager.
     Read-only snapshot ``RepositoryConfig`` objects cannot.
@@ -824,9 +829,10 @@ class RepositoryConfig(Config):
             Creates a generator yielding the contents of this backend for use by a
             :class:`RepositoryConfig._InMemoryBackend._Iterator`.
             """
-            for key in self._read_data.keys():
-                for value in self._read_data[key]:
-                    yield key, value
+            with self.read_lock():
+                for key in self._read_data.keys():
+                    for value in self._read_data[key]:
+                        yield key, value
 
         class _Entry:
             """For internal use only.
@@ -1181,8 +1187,8 @@ def _config_memory_backend_iterator(
     ``_pygit_in_memory_backend_iterator`` and stores references to each in the other,
     then enters the former's context manager to prepare for iteration.
 
-    Does not obtain a lock. The only safe way to iterate a backend is to create a
-    snapshot of the config.
+    Obtains a read lock for the duration of iteration, automatically released when iteration
+    either completes or breaks, without waiting for the iterator to be freed.
 
     C signature:
         int iterator(git_config_iterator **out, git_config_backend * backend);
