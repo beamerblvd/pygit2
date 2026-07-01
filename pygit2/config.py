@@ -24,6 +24,7 @@
 # Boston, MA 02110-1301, USA.
 from __future__ import annotations
 
+import abc
 import contextlib
 import re
 import threading
@@ -464,7 +465,83 @@ class Config:
         return Config._from_found_config(C.git_config_find_xdg)
 
 
-class DefaultConfig(Config):
+class _InMemoryAppBackendConfig(Config, abc.ABC):
+    """For internal use only.
+
+    This base class for :class:`DefaultConfig` and :class:`RepositoryConfig` implements
+    the in-memory backend context manager semantics documented in those respective
+    classes.
+    """
+
+    def __init__(self, *, c_config: 'GitConfigC', is_snapshot: bool) -> None:
+        """For internal use only.
+
+        Constructs a ``Config`` object from a config object pointer.
+        """
+        super().__init__(c_config=c_config, is_snapshot=is_snapshot)
+        self._backend_added = False
+        self._backend = _InMemoryBackend(self)
+
+    @abc.abstractmethod
+    def _add_backend_to_config(self, backend: _InMemoryBackend) -> None:
+        """Adds the backend to the config object."""
+
+    def __enter__(self) -> Self:
+        """Enter a context where all writes occur against an in-memory configuration.
+
+        When entered, all subsequent writes occur against an in-memory configuration
+        backend and do not get persisted to the underlying config file(s). As long as
+        the context endures, Git operations will use the sum total configuration that
+        includes the in-memory configuration.
+
+        Raises ``TypeError`` if this is a read-only snapshot of the configuration.
+        """
+        if self._is_snapshot:
+            raise TypeError(
+                'A read-only config snapshot cannot be used as a context manager, '
+                'because its backend data cannot be changed.'
+            )
+        if not self._backend_added:
+            self._add_backend_to_config(self._backend)
+            self._backend_added = True
+        self._change_write_priority(ConfigLevel.APP)
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> Literal[False]:
+        """Exit the context so that writes occur against the repository config again.
+
+        When exited, any in-memory configuration is erased so that it is no longer
+        effective for repository operations, and subsequent writes again occur against
+        the repository's config and persist to the repository's config file.
+        """
+        if self._backend_added:
+            self._change_write_priority(ConfigLevel.LOCAL)
+            self._backend.clear()
+        return False
+
+    def _change_write_priority(self, level: ConfigLevel) -> None:
+        """For internal use only.
+
+        By default, when libgit2 creates a ``git_config`` object for a repository, it sets
+        the write order to ``{ GIT_CONFIG_LEVEL_LOCAL }``. This means that writes go
+        only to the local config in ``.git/config`` and nowhere else. We need to change
+        this to ``{ GIT_CONFIG_LEVEL_APP }` when entering the context and then back to
+        ``{ GIT_CONFIG_LEVEL_LOCAL }`` when exiting the context.
+        """
+        c_levels = ffi.new(
+            'git_config_level_t[]',
+            [ffi.cast('git_config_level_t', level.value)],
+        )
+        err = C.git_config_set_writeorder(self._config, c_levels, 1)
+        check_error(err)
+
+
+class DefaultConfig(_InMemoryAppBackendConfig):
     """A special-case :class:`Config` extension representing the total default configuration.
 
     This extension to the base ``Config`` class represents the total default configuration
@@ -476,6 +553,21 @@ class DefaultConfig(Config):
     operations that are not against a repository. When a read operation occurs, the
     configurations are searched in the following order: global (user), XDG, system,
     and then program data.
+
+    The ``DefaultConfig`` can also be used as a context manager to effect a temporary
+    in-memory override of the default configuration. When the context manager is entered,
+    an empty in-memory configuration backend is assigned to the configuration and given
+    the highest read priority. During this context, write operations change the in-memory
+    backend and do not affect the configuration file(s). Read operations—including those
+    performed by Git itself—consult the in-memory backend first before then consulting the
+    usual order. When the context manager exits, the in-memory backend's contents are
+    erased, undoing any changes made to it.
+
+    The context manager can be re-entered and then re-exited repeatedly; it is not a
+    one-use-only operation.
+
+    Only writeable ``DefaultConfig`` objects can be used as a context manager.
+    Read-only snapshot ``DefaultConfig`` objects cannot.
     """
 
     @overload
@@ -514,8 +606,12 @@ class DefaultConfig(Config):
             raise TypeError('This default config is already a snapshot.')
         return DefaultConfig(c_snapshot=self._c_snapshot())
 
+    @override
+    def _add_backend_to_config(self, backend: _InMemoryBackend) -> None:
+        backend.add_to_config(self._config)
 
-class RepositoryConfig(Config):
+
+class RepositoryConfig(_InMemoryAppBackendConfig):
     """A special-case :class:`Config` extension that handles local (repository) configuration.
 
     This extension to the base ``Config`` class handles some of the special behaviors
@@ -538,9 +634,9 @@ class RepositoryConfig(Config):
     the highest read priority. During this context, write operations change the in-memory
     backend and do not affect the local configuration file. Read operations—including those
     performed by Git itself—consult the in-memory backend first before then consulting the
-    usual order. When the context manager exits, the in-memory backend is erased, undoing
-    any changes made to it and allowing write operations to resume affecting the local
-    configuration.
+    usual order. When the context manager exits, the in-memory backend's contents are
+    erased, undoing any changes made to it and allowing write operations to resume
+    affecting the local configuration.
 
     The context manager can be re-entered and then re-exited repeatedly; it is not a
     one-use-only operation.
@@ -598,8 +694,6 @@ class RepositoryConfig(Config):
     ) -> None:
         self._repo = repo
         self._c_repo = c_repo
-        self._backend_added = False
-        self._backend = _InMemoryBackend(self)
 
         if c_snapshot is not None:
             super().__init__(c_config=c_snapshot, is_snapshot=True)
@@ -626,59 +720,9 @@ class RepositoryConfig(Config):
             raise TypeError('This repository config is already a snapshot.')
         return RepositoryConfig(self._repo, self._c_repo, c_snapshot=self._c_snapshot())
 
-    def __enter__(self) -> Self:
-        """Enter a context where all writes occur against an in-memory configuration.
-
-        When entered, all subsequent writes occur against an in-memory configuration
-        backend and do not get persisted to the repository's underlying config file.
-        As long as the context endures, repository operations will use the sum total
-        configuration that includes the in-memory configuration.
-
-        Raises ``TypeError`` if this is a read-only snapshot of the local configuration.
-        """
-        if self._is_snapshot:
-            raise TypeError(
-                'A read-only repository config snapshot cannot be used as a context manager, '
-                'because its backend data cannot be changed.'
-            )
-        if not self._backend_added:
-            self._backend.add_to_config(self._config, self._c_repo)
-            self._backend_added = True
-        self._change_write_priority(ConfigLevel.APP)
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: TracebackType | None,
-    ) -> Literal[False]:
-        """Exit the context so that writes occur against the repository config again.
-
-        When exited, any in-memory configuration is erased so that it is no longer
-        effective for repository operations, and subsequent writes again occur against
-        the repository's config and persist to the repository's config file.
-        """
-        if self._backend_added:
-            self._change_write_priority(ConfigLevel.LOCAL)
-            self._backend.clear()
-        return False
-
-    def _change_write_priority(self, level: ConfigLevel) -> None:
-        """For internal use only.
-
-        By default, when libgit2 creates a ``git_config`` object for a repository, it sets
-        the write order to ``{ GIT_CONFIG_LEVEL_LOCAL }``. This means that writes go
-        only to the local config in ``.git/config`` and nowhere else. We need to change
-        this to ``{ GIT_CONFIG_LEVEL_APP }` when entering the context and then back to
-        ``{ GIT_CONFIG_LEVEL_LOCAL }`` when exiting the context.
-        """
-        c_levels = ffi.new(
-            'git_config_level_t[]',
-            [ffi.cast('git_config_level_t', level.value)],
-        )
-        err = C.git_config_set_writeorder(self._config, c_levels, 1)
-        check_error(err)
+    @override
+    def _add_backend_to_config(self, backend: _InMemoryBackend) -> None:
+        backend.add_to_config(self._config, self._c_repo)
 
 
 class _InMemoryBackend:
@@ -689,7 +733,8 @@ class _InMemoryBackend:
     be constructed with (as of 1.9.5) ``git_config_backend_from_string`` or
     ``git_config_backend_from_values``, but that backend is read-only and cannot
     be mutated. To implement the semantics of temporary app-level configuration
-    in :class:`RepositoryConfiguration`, we need to implement our own backend.
+    in :class:`DefaultConfiguration` and :class:`RepositoryConfiguration`, we need
+    to implement our own backend.
 
     We could do so completely in C, but that has some serious downsides, notably
     all the memory management and how easy it is to get wrong and either leak or
@@ -705,7 +750,7 @@ class _InMemoryBackend:
     type_string = cast('char_pointer', ffi.new('char[]', b'pygit2-in-memory'))
     origin_path_string = cast('char_pointer', ffi.new('char[]', b''))
 
-    def __init__(self, config: RepositoryConfig) -> None:
+    def __init__(self, config: _InMemoryAppBackendConfig) -> None:
         self._config = config
 
         self._read_data: dict[str, list[_InMemoryBackend.Entry]] = {}
@@ -765,15 +810,17 @@ class _InMemoryBackend:
     def add_to_config(
         self,
         c_config: 'GitConfigC',
-        c_repo: 'GitRepositoryC',
+        c_repo: 'GitRepositoryC | None' = None,
     ) -> None:
         """For internal use only.
 
-        Adds the backend to the repository's ``git_config``. Called by
-        :meth:`RepositoryConfig.__enter__` the first time it enters, but not any
-        subsequent times. This is because it's not possible to remove a backend
+        Adds the backend to the ``git_config``. Called by
+        :meth:`_InMemoryAppBackendConfig.__enter__` the first time it enters, but not
+        any subsequent times. This is because it's not possible to remove a backend
         from a config with libgit2's public API, and so we rely on clearing
         the backend's contents on ``__exit__``.
+
+        The ``c_repo`` is optional and applies only to repository configurations.
         """
         if self._c_backend is not None:
             raise ValueError('add_to_config called twice')
@@ -800,7 +847,7 @@ class _InMemoryBackend:
             c_config,
             ffi.cast('git_config_backend *', self._c_backend),
             ConfigLevel.APP.value,
-            c_repo,
+            ffi.NULL if c_repo is None else c_repo,
             1,  # force=true
         )
         check_error(err)
@@ -809,7 +856,7 @@ class _InMemoryBackend:
         """For internal use only.
 
         Erases all contents of the backend. Called by
-        :meth:`RepositoryConfig.__exit__` each time it exits.
+        :meth:`_InMemoryAppBackendConfig.__exit__` each time it exits.
         """
         with self.write_lock():
             self._read_data.clear()
@@ -817,7 +864,7 @@ class _InMemoryBackend:
             self._iterators.clear()
             self._c_entries.clear()
 
-    def _multivar_generator(
+    def multivar_generator(
         self,
     ) -> Generator[tuple[str, '_InMemoryBackend.Entry'], None, None]:
         """For internal use only.
@@ -868,7 +915,7 @@ class _InMemoryBackend:
             c_iterator: 'PyGitConfigIteratorWrapperC',
         ) -> None:
             self._backend = backend
-            self._generator = backend._multivar_generator()
+            self._generator = backend.multivar_generator()
             self._c_handle = ffi.new_handle(self)
             self._c_iterator = c_iterator
             self._c_entries: dict[int, 'PyGitConfigIteratorEntryC'] = {}
@@ -1291,8 +1338,9 @@ def _config_memory_backend_free(backend: 'GitConfigBackendC') -> None:
     """For internal use only.
 
     'Member' function of the ``_pygit_in_memory_backend`` struct, invoked by libgit2
-    when it discards the in-memory backend. This occurs only when the repository
-    config is freed, which is only when the repository itself is freed.
+    when it discards the in-memory backend. This occurs only when the
+    config is freed. For a repository config, this is only when the repository itself
+    is freed. For the default config, this is only when the application is unloaded.
 
     C signature:
         void free(git_config_backend *backend);

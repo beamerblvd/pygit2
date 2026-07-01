@@ -334,6 +334,7 @@ def test_repository_config_in_memory_overrides(config: RepositoryConfig) -> None
     assert 'core.override2' not in config
     assert 'core.override3' not in config
     assert 'core.override4' not in config
+    assert 'core.override5' not in config
     assert 'core.local1' not in config
     assert 'core.local2' not in config
     assert 'core.local3' not in config
@@ -372,6 +373,30 @@ def test_repository_config_in_memory_overrides(config: RepositoryConfig) -> None
         config.set_multivar('core.override4', '^ba', 'qux')
         assert list(config.get_multivar('core.override4')) == ['qux']
 
+        # try deleting some stuff
+        assert 'core.override5' not in config
+        config['core.override5'] = 'to be deleted'
+        assert 'core.override5' in config
+        assert config['core.override5'] == 'to be deleted'
+        del config['core.override5']
+        assert 'core.override5' not in config
+
+        config.set_multivar('core.override5', '^$', 'lorem')
+        config.set_multivar('core.override5', '^$', 'ipsum')
+        config.set_multivar('core.override5', '^$', 'dolor')
+        config.set_multivar('core.override5', '^$', 'simet')
+        assert 'core.override5' in config
+        assert list(
+            config.get_multivar('core.override5')
+        ) == ['lorem', 'ipsum', 'dolor', 'simet']
+        config.delete_multivar('core.override5', r'.*or.*')
+        assert 'core.override5' in config
+        assert list(
+            config.get_multivar('core.override5')
+        ) == ['ipsum', 'simet']
+        config.delete_multivar('core.override5', r'.*')
+        assert 'core.override5' not in config
+
         # these should not have been added yet
         assert 'core.local1' not in config
         assert 'core.local2' not in config
@@ -382,6 +407,7 @@ def test_repository_config_in_memory_overrides(config: RepositoryConfig) -> None
     assert 'core.override2' not in config
     assert 'core.override3' not in config
     assert 'core.override4' not in config
+    assert 'core.override5' not in config
 
     # now let's add our local configs to the actual file backend
     assert 'core.local1' not in config
@@ -447,3 +473,95 @@ def test_repository_config_in_memory_overrides(config: RepositoryConfig) -> None
     assert config.get_int('core.local2') == 56
     assert 'core.local3' in config
     assert config['core.local3'] == 'lorem ipsum'
+
+
+def test_default_config_in_memory_overrides() -> None:
+    config = DefaultConfig()
+    assert not config.is_snapshot
+
+    assert 'core.override1' not in config
+    assert 'core.override2' not in config
+    assert 'core.override3' not in config
+    assert 'core.override4' not in config
+    assert 'core.override5' not in config
+
+    with config:
+        # now we should be able to add these to the local in-memory config
+        assert 'core.override1' not in config
+        config['core.override1'] = True
+        assert 'core.override1' in config
+        assert config.get_bool('core.override1')
+
+        assert 'core.override2' not in config
+        config['core.override2'] = 42
+        assert 'core.override2' in config
+        assert config.get_int('core.override2') == 42
+
+        assert 'core.override3' not in config
+        config['core.override3'] = 'foo'
+        assert 'core.override3' in config
+        assert config['core.override3'] == 'foo'
+
+        assert 'core.override4' not in config
+        config.set_multivar('core.override4', '^$', 'bar')
+        assert 'core.override4' in config
+        assert list(config.get_multivar('core.override4')) == ['bar']
+        config.set_multivar('core.override4', '^$', 'baz')
+        assert list(config.get_multivar('core.override4')) == ['bar', 'baz']
+        config.set_multivar('core.override4', '^ba', 'qux')
+        assert list(config.get_multivar('core.override4')) == ['qux']
+
+        # try deleting some stuff
+        assert 'core.override5' not in config
+        config['core.override5'] = 'to be deleted'
+        assert 'core.override5' in config
+        assert config['core.override5'] == 'to be deleted'
+        del config['core.override5']
+        assert 'core.override5' not in config
+
+        config.set_multivar('core.override5', '^$', 'lorem')
+        config.set_multivar('core.override5', '^$', 'ipsum')
+        config.set_multivar('core.override5', '^$', 'dolor')
+        config.set_multivar('core.override5', '^$', 'simet')
+        assert 'core.override5' in config
+        assert list(
+            config.get_multivar('core.override5')
+        ) == ['lorem', 'ipsum', 'dolor', 'simet']
+        config.delete_multivar('core.override5', r'.*or.*')
+        assert 'core.override5' in config
+        assert list(
+            config.get_multivar('core.override5')
+        ) == ['ipsum', 'simet']
+        config.delete_multivar('core.override5', r'.*')
+        assert 'core.override5' not in config
+
+    # it all should have been erased
+    assert 'core.override1' not in config
+    assert 'core.override2' not in config
+    assert 'core.override3' not in config
+    assert 'core.override4' not in config
+    assert 'core.override5' not in config
+
+    with config:
+        # let's try some different values now
+        assert 'core.override1' not in config
+        config['core.override1'] = False
+        assert 'core.override1' in config
+        assert not config.get_bool('core.override1')
+
+        assert 'core.override2' not in config
+        config['core.override2'] = 81
+        assert 'core.override2' in config
+        assert config.get_int('core.override2') == 81
+
+        assert 'core.override3' not in config
+        config['core.override3'] = 'dolor simet'
+        assert 'core.override3' in config
+        assert config['core.override3'] == 'dolor simet'
+
+    # it all should have been erased again
+    assert 'core.override1' not in config
+    assert 'core.override2' not in config
+    assert 'core.override3' not in config
+    assert 'core.override4' not in config
+    assert 'core.override5' not in config
