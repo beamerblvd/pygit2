@@ -607,9 +607,9 @@ def test_repository_config_in_memory_overrides(config: RepositoryConfig) -> None
         assert config.get_int('core.override2') == 81
 
         assert 'core.override3' not in config
-        config['core.override3'] = 'dolor simet'
+        config['core.override3'] = b'binary\xffdata\x80\x9f'
         assert 'core.override3' in config
-        assert config['core.override3'] == 'dolor simet'
+        assert config.get_entry('core.override3').raw_value == b'binary\xffdata\x80\x9f'
 
         # let's make sure snapshots work, too
         snapshot = config.snapshot()
@@ -640,7 +640,7 @@ def test_repository_config_in_memory_overrides(config: RepositoryConfig) -> None
         assert 'core.override2' in snapshot
         assert snapshot.get_int('core.override2') == 81
         assert 'core.override3' in snapshot
-        assert snapshot['core.override3'] == 'dolor simet'
+        assert config.get_entry('core.override3').raw_value == b'binary\xffdata\x80\x9f'
 
     # it all should have been erased again
     assert 'core.override1' not in config
@@ -775,9 +775,9 @@ def test_default_config_in_memory_overrides() -> None:
         assert config.get_int('core.override2') == 81
 
         assert 'core.override3' not in config
-        config['core.override3'] = 'dolor simet'
+        config['core.override3'] = b'binary\xffdata\x80\x9f'
         assert 'core.override3' in config
-        assert config['core.override3'] == 'dolor simet'
+        assert config.get_entry('core.override3').raw_value == b'binary\xffdata\x80\x9f'
 
         # let's make sure snapshots work, too
         snapshot = config.snapshot()
@@ -798,7 +798,7 @@ def test_default_config_in_memory_overrides() -> None:
         assert 'core.override2' in snapshot
         assert snapshot.get_int('core.override2') == 81
         assert 'core.override3' in snapshot
-        assert snapshot['core.override3'] == 'dolor simet'
+        assert config.get_entry('core.override3').raw_value == b'binary\xffdata\x80\x9f'
 
     # it all should have been erased again
     assert 'core.override1' not in config

@@ -204,7 +204,7 @@ class GitConfigC:
 class GitConfigIteratorC:
     backend: 'GitConfigBackendC'
     flags: int
-    next: Callable[['GitConfigBackendEntryC', GitConfigIteratorC], int]
+    next: Callable[['_Pointer[GitConfigBackendEntryC]', GitConfigIteratorC], int]
     free: Callable[[GitConfigIteratorC], None]
 
 class GitConfigEntryC:
@@ -232,8 +232,11 @@ class GitConfigBackendC:
     set_multivar: Callable[
         [GitConfigBackendC, char_pointer, char_pointer, char_pointer], int
     ]
-    # this unfortunate name is actually `del`, but that conflicts with a Python keyword
-    del_: Callable[[GitConfigBackendC, char_pointer], int]
+    # struct git_config_backend contains the following member here that cannot be
+    # represented with a Python attribute due to its name conflicting with Python's
+    # 'del' keyword. CFFI has a workaround for this with other Python keywords
+    # (underscore suffix to the attribute name), but not for `del`:
+    #    (*del)(struct git_config_backend *, const char *)
     del_multivar: Callable[[GitConfigBackendC, char_pointer, char_pointer], int]
     iterator: Callable[[_Pointer[GitConfigIteratorC], GitConfigBackendC], int]
     snapshot: Callable[[_Pointer[GitConfigBackendC], GitConfigBackendC], int]

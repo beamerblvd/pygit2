@@ -27,9 +27,7 @@ from __future__ import annotations
 import abc
 import contextlib
 import re
-import sys
 import threading
-import weakref
 from collections.abc import Callable, Generator, Iterator, Sequence
 from functools import cached_property
 from os import PathLike
@@ -266,7 +264,7 @@ class Config:
         except AttributeError:
             pass
 
-    def _check_error(self, err: int, io: bool = False):
+    def _check_error(self, err: int, io: bool = False) -> None:
         try:
             check_error(err, io=io, user_exception=self._stored_exception)
         finally:
@@ -286,7 +284,26 @@ class Config:
 
         return err, None
 
-    def _get_entry(self, name: str | bytes) -> 'ConfigEntry':
+    def get_entry(self, name: str | bytes) -> 'ConfigEntry':
+        """Obtain the first entry found for a config var with name ``name``.
+
+        Looks for a config var with name ``name`` and returns the associated
+        ``ConfigEntry``.
+
+        If the config var found is a multivar, only the last value is returned. To
+        obtain all values, use :meth:`Config.get_multivar` instead of ``get_entry``.
+
+        If this ``Config`` is backed by multiple files/backends, the one with the highest
+        :class:`pygit2.enums.ConfigLevel` is searched first, and then the next-highest
+        level, and so on.
+
+        :param name: The name of the config var to look for.
+
+        :returns: The entry found for the config var with name ``name``.
+
+        :raises KeyError: If no config var with name ``name`` is found in any
+                          of this ``Config``'s files/backends.
+        """
         self._stored_exception = None
         err, entry = self._get(name)
 
@@ -322,7 +339,7 @@ class Config:
         Git config parsing rules, use :meth:`Config.get_bool` or
         :meth:`Config.get_int` instead of ``[name]``.
 
-        If the config var found is a multivar, only the first value is returned. To
+        If the config var found is a multivar, only the last value is returned. To
         obtain all values, use :meth:`Config.get_multivar` instead of ``[name]``.
 
         If this ``Config`` is backed by multiple files/backends, the one with the highest
@@ -331,13 +348,15 @@ class Config:
 
         :param name: The name of the config var to look for.
 
-        :returns: The string value found for the config var with name ``name`` or,
-                  in the case of a valueless flag, ``None``.
+        :returns: The UTF-8-decoded string value found for the config var with name
+                  ``name`` or, in the case of a valueless flag, ``None``. If the value
+                  may contain binary data that can't be decoded, use
+                  :meth:`Config.get_entry`, instead.
 
         :raises KeyError: If no config var with name ``name`` is found in any
                           of this ``Config``'s files/backends.
         """
-        entry = self._get_entry(name)
+        entry = self.get_entry(name)
 
         return entry.value
 
@@ -528,7 +547,7 @@ class Config:
                             or falsy values.
         """
         self._stored_exception = None
-        entry = self._get_entry(name)
+        entry = self.get_entry(name)
         return self.parse_bool(entry.value)
 
     def get_int(self, name: bytes | str) -> int:
@@ -558,7 +577,7 @@ class Config:
                             match the ``git_config_parse_int64`` parsing rules.
         """
         self._stored_exception = None
-        entry = self._get_entry(name)
+        entry = self.get_entry(name)
         return self.parse_int(entry.value)
 
     def add_file(
@@ -792,32 +811,42 @@ class _InMemoryAppBackendConfig(Config, abc.ABC):
         that may or may not already have the in-memory backend attached to it
         (snapshot_of=not None).
 
-        In the latter case, we check whether snapshot_of._on_snapshot_completion is
-        set; if it is, that means the in-memory backend was attached when the
-        snapshot was created, and libgit2 invoked its snapshot callback. This config
-        object doesn't yet know about the backend snapshot, and the backend snapshot
-        doesn't yet know about this config object. We invoke _on_snapshot_completion
-        to inform the backend snapshot about this config object and obtain the
-        backend snapshot instance.
+        In the latter case, we check whether snapshot_of._backend_added is
+        true; if it is, that means the in-memory backend was attached when the
+        snapshot was created, and libgit2 invoked its snapshot callback. In this case,
+        we use the same backend. Otherwise, we use a new backend.
         """
         super().__init__(
             c_config=c_config,
             is_snapshot=is_snapshot or snapshot_of is not None,
         )
 
-        self._on_snapshot_completion: (
-            Callable[[_InMemoryAppBackendConfig], _InMemoryBackend] | None
-        ) = None
+        self._backend_added: bool
+        self._backend: _InMemoryBackend
 
-        if snapshot_of is not None and snapshot_of._on_snapshot_completion is not None:
+        if snapshot_of is not None and snapshot_of._backend_added:
             self._backend_added = True
-            self._backend = snapshot_of._on_snapshot_completion(self)
-            snapshot_of._on_snapshot_completion = None
+            self._backend = snapshot_of._backend
         else:
             self._backend_added = False
             self._backend = _InMemoryBackend(config=self)
 
         self._backend_active = False
+
+    def _check_error(self, err: int, io: bool = False) -> None:
+        try:
+            check_error(
+                err,
+                io=io,
+                user_exception=(
+                    self._stored_exception
+                    if self._backend._stored_exception is None
+                    else self._backend._stored_exception
+                ),
+            )
+        finally:
+            self._stored_exception = None
+            self._backend._stored_exception = None
 
     @abc.abstractmethod
     def _add_backend_to_config(self, backend: _InMemoryBackend) -> None:
@@ -889,8 +918,13 @@ class _InMemoryAppBackendConfig(Config, abc.ABC):
         only to the local config in ``.git/config`` and nowhere else. We need to change
         this to ``{ GIT_CONFIG_LEVEL_APP }`` when entering the context and then back to
         ``{ GIT_CONFIG_LEVEL_LOCAL }`` when exiting the context. For the non-repo "default"
-        config, the default we want to restore is ``{ GIT_CONFIG_LEVEL_GLOBAL,
-        GIT_CONFIG_LEVEL_XDG, GIT_CONFIG_LEVEL_SYSTEM, GIT_CONFIG_LEVEL_PROGRAMDATA }``.
+        config, the default we want to restore is ``{ GIT_CONFIG_LEVEL_PROGRAMDATA,
+        GIT_CONFIG_LEVEL_SYSTEM, GIT_CONFIG_LEVEL_XDG, GIT_CONFIG_LEVEL_GLOBAL }``.
+
+        The "winner" in level selection is based on the higher index of the array passed
+        to ``git_config_set_writeorder``. The first element in the array is actually the
+        lowest priority and the last element in the array is actually the highest
+        priority.
         """
         c_levels = ffi.new(
             'git_config_level_t[]',
@@ -979,18 +1013,21 @@ class DefaultConfig(_InMemoryAppBackendConfig):
         """
         if self._is_snapshot:
             raise TypeError('This default config is already a snapshot.')
-        self._on_snapshot_completion = None
         return DefaultConfig(snapshot_of=self)
 
     def _add_backend_to_config(self, backend: _InMemoryBackend) -> None:
         backend.add_to_config(self._c_config)
 
     def _default_write_order(self) -> Sequence[ConfigLevel]:
+        # The write order is reverse of what you might think. Higher array indexes
+        # "win" over lower array indexes, so the last level in this sequence is
+        # written to first/highest-priority and the first level in this sequence
+        # is written to last/lowest-priority.
         return (
-            ConfigLevel.GLOBAL,
-            ConfigLevel.XDG,
-            ConfigLevel.SYSTEM,
             ConfigLevel.PROGRAMDATA,
+            ConfigLevel.SYSTEM,
+            ConfigLevel.XDG,
+            ConfigLevel.GLOBAL,
         )
 
     def add_file(
@@ -1118,7 +1155,6 @@ class RepositoryConfig(_InMemoryAppBackendConfig):
         """
         if self._is_snapshot:
             raise TypeError('This repository config is already a snapshot.')
-        self._on_snapshot_completion = None
         return RepositoryConfig(self._repo, self._c_repo, snapshot_of=self)
 
     def _add_backend_to_config(self, backend: _InMemoryBackend) -> None:
@@ -1285,24 +1321,14 @@ class _InMemoryBackend:
         config: _InMemoryAppBackendConfig | None = None,
         snapshot_of: _InMemoryBackend | None = None,
     ) -> None:
-        self._weak_config: weakref.ReferenceType[_InMemoryAppBackendConfig]
         self._read_data: dict[str, list[_InMemoryBackend.Entry]]
 
         if snapshot_of is not None:
             if config is not None:
                 raise ValueError('Cannot specify both `config` and `snapshot_of`.')
-            config = snapshot_of._weak_config()
-            if config is None:
-                raise ValueError(
-                    'Cannot create snapshot of backend with null weak reference to '
-                    'parent config.'
-                )
-            config._on_snapshot_completion = self._do_on_snapshot_completion
-            self._weak_config = weakref.ref(config)
             self._is_snapshot = True
             self._read_data = {k: v[:] for k, v in snapshot_of._read_data.items()}
         elif config is not None:
-            self._weak_config = weakref.ref(config)
             self._is_snapshot = False
             self._read_data = {}
         else:
@@ -1322,12 +1348,7 @@ class _InMemoryBackend:
         self._iterators: dict[int, _InMemoryBackend.Iterator] = {}
         self._c_entries: dict[int, 'PyGitConfigBackendEntryC'] = {}
 
-    def _do_on_snapshot_completion(
-        self,
-        actual_config: _InMemoryAppBackendConfig,
-    ) -> Self:
-        self._weak_config = weakref.ref(actual_config)
-        return self
+        self._stored_exception: BaseException | None = None
 
     @contextlib.contextmanager
     def read_lock(self) -> Generator[None, None, None]:
@@ -1426,6 +1447,14 @@ class _InMemoryBackend:
     def clear(self) -> None:
         """Erases all contents of the backend. Called by
         :meth:`_InMemoryAppBackendConfig.__exit__` each time it exits.
+
+        Note that, at first glance, this may appear to create a use-after-free
+        scenario, because it drops ``_c_entries`` / ``_iterators`` while libgit2
+        may still hold raw pointers into that cdata (e.g. a ``ConfigEntry`` from
+        ``get_entry`` alive across context exit, freed later -> use-after-free
+        window). However, ``Config._get`` frees entries immediately after the
+        eager copy and so does ``_BaseIterator``, so that closes the use-after-free
+        window before ``clear()`` can ever be called.
         """
         if not self._is_snapshot:
             with self.write_lock():
@@ -1438,24 +1467,23 @@ class _InMemoryBackend:
         self,
     ) -> Generator[tuple[str, '_InMemoryBackend.Entry'], None, None]:
         """Creates a generator yielding the contents of this backend for use by a
-        :class:`_InMemoryBackend.Iterator`.
+        :class:`_InMemoryBackend.Iterator`. Iteration operates off of an internal
+        snapshot of the config data made at the time the generator is constructed.
+        Changes to the underlying data during iteration are allowed and not reflected
+        in the iterated data.
         """
         with self.read_lock():
-            for key in self._read_data.keys():
-                for value in self._read_data[key]:
-                    yield key, value
+            item_snapshot = [
+                (key, value)
+                for key, values in self._read_data.items()
+                for value in values
+            ]
+
+        for key, value in item_snapshot:
+            yield key, value
 
     def store_exception(self, e: BaseException) -> None:
-        config = self._weak_config()
-        if config:
-            config._stored_exception = e
-        else:
-            sys.stderr.write(
-                f'Failed to store exception in C handler for later use in Python '
-                f'because backend config weakref has already been garbage '
-                f'collected: {e}\n',
-            )
-            sys.stderr.flush()
+        self._stored_exception = e
 
     class Entry:
         """For internal use only.
@@ -1465,7 +1493,7 @@ class _InMemoryBackend:
         cleared or freed.
         """
 
-        def __init__(self, name: str, value: str) -> None:
+        def __init__(self, name: str, value: bytes) -> None:
             self.name = name
             self.c_name = cast(
                 'char_pointer',
@@ -1474,7 +1502,7 @@ class _InMemoryBackend:
             self.value = value
             self.c_value = cast(
                 'char_pointer',
-                ffi.new('char[]', value.encode('utf-8')),
+                ffi.new('char[]', value),
             )
 
         def __repr__(self):
@@ -1505,6 +1533,7 @@ class _InMemoryBackend:
             if not self._closed:
                 self._closed = True
                 self._generator.close()
+                self._backend._iterators.pop(id(self), None)
 
         def __next__(self) -> tuple[str, _InMemoryBackend.Entry]:
             if self._closed:
@@ -1522,7 +1551,6 @@ class _InMemoryBackend:
             exc_tb: TracebackType | None,
         ) -> Literal[False]:
             self.close()
-            self._backend._iterators.pop(id(self), None)
             return False
 
         def __del__(self) -> None:
@@ -1649,9 +1677,10 @@ def _config_memory_backend_set(
             return C.GIT_EREADONLY
         key = ffi.string(name).decode('utf-8')
         key_lowered = key.casefold()
-        decoded_value = ffi.string(value).decode('utf-8')
         with self.write_lock():
-            self._write_data[key_lowered] = [_InMemoryBackend.Entry(key, decoded_value)]
+            self._write_data[key_lowered] = [
+                _InMemoryBackend.Entry(key, ffi.string(value)),
+            ]
     except BaseException as e:
         self.store_exception(e)
         return C.GIT_EUSER
@@ -1693,7 +1722,14 @@ def _config_memory_backend_set_multivar(
         key_lowered = key.casefold()
         with self.write_lock():
             if key_lowered in self._write_data and regexp != ffi.NULL:
-                expression = re.compile(ffi.string(regexp).decode('utf-8'))
+                # expected behavior if a regex is supplied:
+                # - zero matches: no existing entries are modified, new entry added
+                # - one or more matches: matches are removed, new entry added
+                # - all entries match: all entries removed, new entry added
+                #
+                # Entry values are unspecified binary data (not necessarily UTF-8,
+                # etc.), so the regular expression must also be binary.
+                expression = re.compile(ffi.string(regexp))  # bytes-based regex
                 self._write_data[key_lowered] = [
                     v
                     for v in self._write_data[key_lowered]
@@ -1702,7 +1738,7 @@ def _config_memory_backend_set_multivar(
             elif key_lowered not in self._write_data:
                 self._write_data[key_lowered] = []
             self._write_data[key_lowered].append(
-                _InMemoryBackend.Entry(key, ffi.string(value).decode('utf-8')),
+                _InMemoryBackend.Entry(key, ffi.string(value)),
             )
     except BaseException as e:
         self.store_exception(e)
@@ -1778,7 +1814,7 @@ def _config_memory_backend_del_multivar(
             if regexp == ffi.NULL:
                 del self._write_data[key_lowered]
             else:
-                expression = re.compile(ffi.string(regexp).decode('utf-8'))
+                expression = re.compile(ffi.string(regexp))
                 self._write_data[key_lowered] = [
                     v
                     for v in self._write_data[key_lowered]
@@ -1824,8 +1860,10 @@ def _config_memory_backend_iterator(
     ``_pygit_in_memory_backend_iterator`` and stores references to each in the other,
     then enters the former's context manager to prepare for iteration.
 
-    Obtains a read lock for the duration of iteration, automatically released when iteration
-    either completes or breaks, without waiting for the iterator to be freed.
+    Briefly obtains a read lock, creates an internal snapshot of the read data at the time
+    of iteration construction, releases the read lock, and then begins iteration. As a
+    result, changes made to the configuration during iteration are allowed and not
+    reflected in the iterated items.
 
     C signature:
         int iterator(git_config_iterator **out, git_config_backend * backend);
